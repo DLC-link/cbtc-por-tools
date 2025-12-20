@@ -1,0 +1,431 @@
+#!/usr/bin/env ts-node
+
+/**
+ * Bitcoin Address Calculation and Proof of Reserve Calculator for CBTC Bridge
+ *
+ * This script independently calculates Bitcoin deposit addresses for the CBTC bridge
+ * and sums all UTXOs to verify the total BTC held in reserve.
+ *
+ * The key principle is TRUSTLESSNESS - we never trust the attestor's provided addresses.
+ * Instead, we independently calculate every address from the threshold public key
+ * and deposit account IDs, then verify they match what the attestor reports.
+ *
+ * Usage:
+ *   npm install bitcoinjs-lib bip32 tiny-secp256k1 @types/node ts-node typescript
+ *   ts-node calculate-bitcoin-addresses.ts <attestor_url>
+ *
+ * Example:
+ *   ts-node calculate-bitcoin-addresses.ts http://localhost:8080
+ */
+
+import * as bitcoin from 'bitcoinjs-lib';
+import BIP32Factory from 'bip32';
+import * as crypto from 'crypto';
+import * as ecc from 'tiny-secp256k1';
+
+// Initialize ECC library for bitcoinjs-lib (required for Taproot operations)
+bitcoin.initEccLib(ecc);
+
+// Initialize BIP32 library with elliptic curve implementation
+const bip32 = BIP32Factory(ecc);
+
+/**
+ * Constants from the Rust implementation
+ * These must match exactly to generate the correct addresses
+ */
+
+// Fixed unspendable public key used as the base for internal key derivation
+// This key is intentionally chosen to be unspendable to enhance security
+const UNSPENDABLE_PUBLIC_KEY = '0250929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0';
+
+// Parent fingerprint for BIP32 derivation (all zeros = root/no parent)
+const PARENT_FINGERPRINT = Buffer.from('00000000', 'hex');
+
+// Depth in the BIP32 hierarchy (3 = third level of derivation)
+const DEPTH = 3;
+
+/**
+ * TypeScript interfaces matching the API response structure
+ */
+
+// Individual address info for a single deposit account
+interface AddressInfo {
+  id: string; // Deposit account ID (hex string)
+  address_for_verification: string; // Bitcoin P2TR address (DO NOT TRUST - calculate independently!)
+}
+
+// Group of addresses sharing the same xpub (one per Canton chain)
+interface ChainAddressGroup {
+  chain: string; // Canton network name (e.g., "devnet")
+  xpub: string; // BIP32 extended public key (already derived to m/0/0)
+  addresses: AddressInfo[]; // All deposit accounts on this chain
+}
+
+// Top-level API response
+interface ApiResponse {
+  chains: ChainAddressGroup[]; // Array of chain groups
+  bitcoin_network: string; // "mainnet", "testnet", or "regtest"
+}
+
+// UTXO data structure from Esplora API
+interface UTXO {
+  txid: string; // Transaction ID
+  vout: number; // Output index
+  value: number; // Value in satoshis
+  status: {
+    confirmed: boolean; // Whether transaction is confirmed
+    block_height?: number; // Block height if confirmed
+  };
+}
+
+/**
+ * Hash a string using SHA-256
+ *
+ * This is used to derive the chain code for the unspendable key from the deposit ID.
+ * The deterministic nature ensures the same ID always produces the same address.
+ *
+ * @param input - String to hash (typically the deposit account ID)
+ * @returns 32-byte SHA-256 hash
+ */
+function hashString(input: string): Buffer {
+  return crypto.createHash('sha256').update(input, 'utf8').digest();
+}
+
+/**
+ * Convert network string to bitcoinjs-lib network object
+ *
+ * @param networkStr - Network name from API ("mainnet", "testnet", "regtest")
+ * @returns Bitcoin network configuration object
+ */
+function getBitcoinNetwork(networkStr: string): bitcoin.Network {
+  switch (networkStr.toLowerCase()) {
+    case 'mainnet':
+    case 'bitcoin':
+      return bitcoin.networks.bitcoin;
+    case 'testnet':
+      return bitcoin.networks.testnet;
+    case 'regtest':
+      return bitcoin.networks.regtest;
+    default:
+      throw new Error(`Unknown network: ${networkStr}`);
+  }
+}
+
+/**
+ * Derive the unspendable internal key from a deposit ID
+ *
+ * This creates a deterministic but unspendable key that serves as the
+ * Taproot internal key. The key is "unspendable" because:
+ * 1. The base public key has no known private key
+ * 2. It's tweaked with the Taproot script tree
+ *
+ * The Rust implementation creates an ExtendedPubKey with:
+ * - publicKey: UNSPENDABLE_PUBLIC_KEY
+ * - chainCode: SHA256(id)
+ * - depth: 3
+ * - parentFingerprint: 0x00000000
+ * - childNumber: first hardened child (0x80000000)
+ *
+ * Then derives it at m/0/0 to get the final internal key.
+ *
+ * We simplify by directly computing the derived public key using BIP32 math,
+ * which produces the same result as the Rust implementation.
+ *
+ * @param id - Deposit account ID (hex string from Canton)
+ * @param network - Bitcoin network configuration
+ * @returns X-only public key (32 bytes, for Taproot)
+ */
+function deriveUnspendableKey(id: string, network: bitcoin.Network): Buffer {
+  // Hash the deposit ID to get a deterministic 32-byte chain code
+  // This makes the internal key unique per deposit account
+  const chainCode = hashString(id);
+
+  // Parse the fixed unspendable public key (33 bytes, compressed format)
+  const publicKey = Buffer.from(UNSPENDABLE_PUBLIC_KEY, 'hex');
+
+  // Create the extended key with our custom chain code
+  // The chain code derived from the ID ensures uniqueness
+  const extendedKey = bip32.fromPublicKey(publicKey, chainCode, network);
+
+  // Derive at path m/0/0 using BIP32 non-hardened derivation
+  // Child 0, then another child 0
+  const derived = extendedKey.derive(0).derive(0);
+
+  // Return x-only public key by stripping the first byte (0x02 or 0x03 prefix)
+  // Taproot uses 32-byte x-only keys instead of 33-byte compressed keys
+  return derived.publicKey.slice(1);
+}
+
+/**
+ * Calculate the Taproot address for a deposit account
+ *
+ * This is the core algorithm that independently calculates the Bitcoin address.
+ * The address is a P2TR (Pay-to-Taproot) address with script-path spending enabled.
+ *
+ * Steps:
+ * 1. Create Taproot script: <x_only_pubkey> OP_CHECKSIG
+ * 2. Derive unspendable internal key from deposit ID
+ * 3. Build Taproot tree with the script
+ * 4. Tweak internal key with tree hash (BIP341)
+ * 5. Create P2TR output script
+ * 6. Encode as Bech32m address
+ *
+ * @param id - Deposit account ID (hex string)
+ * @param xOnlyPubkey - X-only threshold group public key (32 bytes)
+ * @param network - Bitcoin network configuration
+ * @returns Taproot address (Bech32m encoded)
+ */
+function calculateTaprootAddress(id: string, xOnlyPubkey: Buffer, network: bitcoin.Network): string {
+  // Step 1: Create the Taproot script for script-path spending
+  // This script requires a Schnorr signature from the threshold group pubkey
+  // Format: <32-byte x-only pubkey> OP_CHECKSIG
+  const script = bitcoin.script.compile([xOnlyPubkey, bitcoin.opcodes.OP_CHECKSIG]);
+
+  // Step 2: Get the unspendable internal key (deterministic from deposit ID)
+  // This key is used as the Taproot internal key and will be tweaked
+  const internalPubkey = deriveUnspendableKey(id, network);
+
+  // Step 3: Calculate the taproot tree hash (TapLeaf hash)
+  // The leaf version 0xc0 indicates TAPROOT_LEAF_TAPSCRIPT
+  const leafVersion = 0xc0;
+
+  // Build the leaf: version || compact_size(script_length) || script
+  const tapLeaf = Buffer.concat([Buffer.from([leafVersion]), bitcoin.script.compile([script.length]), script]);
+
+  // Calculate tagged hash: SHA256(SHA256("TapLeaf") || SHA256("TapLeaf") || leaf_data)
+  // Tagged hashes are used throughout Taproot to prevent cross-protocol attacks
+  const tagHash = crypto.createHash('sha256').update('TapLeaf').digest();
+  const taggedHash = crypto
+    .createHash('sha256')
+    .update(Buffer.concat([tagHash, tagHash, tapLeaf]))
+    .digest();
+
+  // Step 4: Calculate the Taproot tweak
+  // tweak = tagged_hash("TapTweak", internal_pubkey || merkle_root)
+  // The tweak commits to both the internal key and the script tree
+  const tapTweakTag = crypto.createHash('sha256').update('TapTweak').digest();
+  const tapTweakHash = crypto
+    .createHash('sha256')
+    .update(Buffer.concat([tapTweakTag, tapTweakTag, internalPubkey, taggedHash]))
+    .digest();
+
+  // Step 5: Tweak the internal key by adding the tweak point
+  // This produces the final Taproot output key: Q = P + hash(P || m)G
+  // where P is internal key, m is merkle root, G is generator point
+  const tweakedKey = ecc.xOnlyPointAddTweak(internalPubkey, tapTweakHash);
+  if (!tweakedKey) {
+    throw new Error('Failed to tweak public key - this should never happen');
+  }
+
+  // Step 6: Create the P2TR payment and encode as Bech32m address
+  // bitcoinjs-lib handles the address encoding for us
+  const payment = bitcoin.payments.p2tr({
+    internalPubkey, // Original internal key (not tweaked)
+    scriptTree: {
+      output: script, // The script we want to commit to
+    },
+    network,
+  });
+
+  if (!payment.address) {
+    throw new Error('Failed to generate address - invalid payment');
+  }
+
+  return payment.address;
+}
+
+/**
+ * Fetch all deposit addresses from the attestor API
+ *
+ * This queries the attestor to get:
+ * - All Canton chains (different signer groups)
+ * - The xpub for each chain (threshold group public key)
+ * - All deposit account IDs on each chain
+ * - The Bitcoin network (mainnet/testnet/regtest)
+ *
+ * @param attestorUrl - Base URL of the attestor (e.g., "http://localhost:8080")
+ * @returns API response with chains and addresses
+ */
+async function fetchDepositAddresses(attestorUrl: string): Promise<ApiResponse> {
+  const url = `${attestorUrl}/app/get-address-calculation-data`;
+  console.log(`Fetching address calculation data from: ${url}`);
+
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(`HTTP error! status: ${response.status}`);
+  }
+
+  return (await response.json()) as ApiResponse;
+}
+
+/**
+ * Fetch UTXOs for an address using the Esplora API
+ *
+ * This queries the Bitcoin blockchain to find all unspent outputs (UTXOs)
+ * at a given address. We use public Esplora instances for simplicity.
+ *
+ * For production use, consider running your own Esplora instance or using
+ * multiple sources (Electrum, Bitcoin Core RPC) for redundancy.
+ *
+ * @param address - Bitcoin address (P2TR/Bech32m format)
+ * @param network - Bitcoin network configuration
+ * @returns Array of UTXOs at this address
+ */
+async function fetchUTXOs(address: string, network: bitcoin.Network): Promise<UTXO[]> {
+  // Select Esplora instance based on network
+  // For production, use your own Esplora instance or multiple sources
+  let esploraUrl: string;
+  if (network === bitcoin.networks.bitcoin) {
+    esploraUrl = 'https://blockstream.info/api';
+  } else if (network === bitcoin.networks.testnet) {
+    esploraUrl = 'https://blockstream.info/testnet/api';
+  } else {
+    // Regtest uses local Esplora instance (electrs)
+    esploraUrl = process.env.ESPLORA_API || 'http://localhost:3004';
+  }
+
+  const url = `${esploraUrl}/address/${address}/utxo`;
+
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
+      console.warn(`Failed to fetch UTXOs for ${address}: ${response.status}`);
+      return [];
+    }
+    return (await response.json()) as UTXO[];
+  } catch (error) {
+    console.warn(`Error fetching UTXOs for ${address}:`, error);
+    return [];
+  }
+}
+
+/**
+ * Main verification and calculation function
+ *
+ * This is the entry point that:
+ * 1. Fetches deposit account data from the attestor
+ * 2. Independently calculates each Bitcoin address
+ * 3. Verifies calculated addresses match what the attestor reports
+ * 4. Queries the Bitcoin blockchain for UTXOs
+ * 5. Sums all UTXO values to get total BTC in reserve
+ *
+ * The key security property is that we NEVER trust the attestor's addresses.
+ * We always recalculate them from the threshold pubkey and deposit IDs.
+ *
+ * @param attestorUrl - Base URL of the attestor API
+ */
+async function verifyAndCalculateReserve(attestorUrl: string): Promise<void> {
+  console.log('='.repeat(80));
+  console.log('Bitcoin Address Calculation and Proof of Reserve');
+  console.log('='.repeat(80));
+  console.log();
+
+  // Step 1: Fetch all deposit account data from the attestor
+  const data = await fetchDepositAddresses(attestorUrl);
+  const network = getBitcoinNetwork(data.bitcoin_network);
+
+  console.log(`Network: ${data.bitcoin_network}`);
+  console.log(`Total chains: ${data.chains.length}`);
+  console.log();
+
+  // Counters for summary
+  let verifiedCount = 0;
+  let failedCount = 0;
+  const failedAddresses: string[] = [];
+
+  let totalBTC = 0;
+  let totalUTXOs = 0;
+
+  // Step 2: Process each chain (different Canton networks with different signer groups)
+  for (const chainGroup of data.chains) {
+    console.log(`Chain: ${chainGroup.chain} (xpub: ${chainGroup.xpub.substring(0, 20)}...)`);
+
+    // Parse the xpub to get the threshold group's x-only public key
+    // The xpub is already derived to m/0/0, so we just extract the pubkey
+    const xpubDecoded = bip32.fromBase58(chainGroup.xpub, network);
+
+    // Convert from 33-byte compressed key to 32-byte x-only key
+    // Taproot uses x-only keys (just the x-coordinate, no prefix byte)
+    const xOnlyPubkey = xpubDecoded.publicKey.slice(1);
+
+    // Step 3: Process each deposit account on this chain
+    for (const addressInfo of chainGroup.addresses) {
+      try {
+        // **CRITICAL STEP**: Calculate the address independently
+        // We NEVER trust the attestor's provided address
+        const calculatedAddress = calculateTaprootAddress(addressInfo.id, xOnlyPubkey, network);
+
+        // Verify our calculated address matches what the attestor reported
+        // If it doesn't match, the attestor is either broken or malicious
+        if (calculatedAddress !== addressInfo.address_for_verification) {
+          console.error(`❌ Address mismatch for ID ${addressInfo.id.substring(0, 16)}...`);
+          console.error(`   Attestor provided: ${addressInfo.address_for_verification}`);
+          console.error(`   We calculated:     ${calculatedAddress}`);
+          failedCount++;
+          failedAddresses.push(addressInfo.id);
+          continue;
+        }
+
+        verifiedCount++;
+
+        // Step 4: Fetch UTXOs from the Bitcoin blockchain
+        // This is the actual proof of reserve - checking what BTC exists on-chain
+        const utxos = await fetchUTXOs(calculatedAddress, network);
+        const addressValue = utxos.reduce((sum, utxo) => sum + utxo.value, 0);
+
+        totalUTXOs += utxos.length;
+        totalBTC += addressValue;
+
+        // Only print addresses that have UTXOs (to reduce noise)
+        if (utxos.length > 0) {
+          console.log(`✅ ${calculatedAddress}: ${utxos.length} UTXOs, ${addressValue / 1e8} BTC`);
+        }
+      } catch (error) {
+        console.error(`❌ Error processing ${addressInfo.id.substring(0, 16)}...:`, error);
+        failedCount++;
+        failedAddresses.push(addressInfo.id);
+      }
+    }
+
+    console.log(); // Blank line between chains
+  }
+
+  // Step 5: Print summary
+  console.log('='.repeat(80));
+  console.log('Summary');
+  console.log('='.repeat(80));
+  console.log(`✅ Verified addresses: ${verifiedCount}/${verifiedCount + failedCount}`);
+  if (failedCount > 0) {
+    console.log(`❌ Failed addresses: ${failedCount}`);
+    console.log(`   Failed IDs: ${failedAddresses.map((id) => id.substring(0, 16)).join(', ')}...`);
+  }
+  console.log();
+  console.log(`Total UTXOs: ${totalUTXOs}`);
+  console.log(`Total BTC in Reserve: ${(totalBTC / 1e8).toFixed(8)} BTC`);
+  console.log('='.repeat(80));
+
+  // Exit with error code if any verification failed
+  if (failedCount > 0) {
+    process.exit(1);
+  }
+}
+
+// Main execution
+if (require.main === module) {
+  // Get attestor URL from command line argument or use default
+  const attestorUrl = process.argv[2] || 'http://localhost:8080';
+
+  verifyAndCalculateReserve(attestorUrl)
+    .then(() => {
+      console.log('✅ Verification complete!');
+      process.exit(0);
+    })
+    .catch((error) => {
+      console.error('❌ Verification failed:', error);
+      process.exit(1);
+    });
+}
+
+// Export functions for use as a library
+export { calculateTaprootAddress, verifyAndCalculateReserve };

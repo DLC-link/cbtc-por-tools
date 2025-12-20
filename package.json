@@ -1,0 +1,30 @@
+{
+  "name": "cbtc-address-calculation",
+  "version": "1.0.0",
+  "description": "Bitcoin address calculation and proof of reserve calculator for CBTC bridge",
+  "main": "calculate-bitcoin-addresses.ts",
+  "scripts": {
+    "calculate": "ts-node calculate-bitcoin-addresses.ts",
+    "calculate:local": "ts-node calculate-bitcoin-addresses.ts http://localhost:8080",
+    "calculate:testnet": "ts-node calculate-bitcoin-addresses.ts https://testnet-attestor.dlc.link"
+  },
+  "dependencies": {
+    "bip32": "^4.0.0",
+    "bitcoinjs-lib": "^6.1.7",
+    "tiny-secp256k1": "^2.2.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.27",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  },
+  "keywords": [
+    "bitcoin",
+    "taproot",
+    "proof-of-reserve",
+    "dlc",
+    "threshold-signatures"
+  ],
+  "author": "DLC.Link",
+  "license": "Apache-2.0"
+}
