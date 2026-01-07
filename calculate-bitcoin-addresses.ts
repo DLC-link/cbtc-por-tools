@@ -260,6 +260,53 @@ async function fetchDepositAddresses(attestorUrl: string): Promise<ApiResponse> 
 }
 
 /**
+ * Get the Esplora URL for the given network
+ *
+ * @param network - Bitcoin network configuration
+ * @returns Esplora API base URL
+ */
+function getEsploraUrl(network: bitcoin.Network): string {
+  // If ESPLORA_API env var is set, always use it regardless of network
+  if (process.env.ESPLORA_API) {
+    return process.env.ESPLORA_API;
+  }
+
+  // Otherwise fall back to default public Esplora instances
+  // Note: public Esplora endpoints are rate limited
+  if (network === bitcoin.networks.bitcoin) {
+    return 'https://blockstream.info/api';
+  } else if (network === bitcoin.networks.testnet) {
+    return 'https://blockstream.info/testnet/api';
+  } else {
+    // Regtest uses local Esplora instance (electrs)
+    return 'http://localhost:3004';
+  }
+}
+
+/**
+ * Fetch current block height from Esplora API
+ *
+ * @param network - Bitcoin network configuration
+ * @returns Current block height, or undefined if fetch fails
+ */
+async function fetchBlockHeight(network: bitcoin.Network): Promise<number | undefined> {
+  const esploraUrl = getEsploraUrl(network);
+  const url = `${esploraUrl}/blocks/tip/height`;
+
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
+      console.warn(`Failed to fetch block height: ${response.status}`);
+      return undefined;
+    }
+    return (await response.json()) as number;
+  } catch (error) {
+    console.warn(`Error fetching block height:`, error);
+    return undefined;
+  }
+}
+
+/**
  * Fetch UTXOs for an address using the Esplora API
  *
  * This queries the Bitcoin blockchain to find all unspent outputs (UTXOs)
@@ -273,18 +320,7 @@ async function fetchDepositAddresses(attestorUrl: string): Promise<ApiResponse> 
  * @returns Array of UTXOs at this address
  */
 async function fetchUTXOs(address: string, network: bitcoin.Network): Promise<UTXO[]> {
-  // Select Esplora instance based on network
-  // For production, use your own Esplora instance or multiple sources
-  let esploraUrl: string;
-  if (network === bitcoin.networks.bitcoin) {
-    esploraUrl = 'https://blockstream.info/api';
-  } else if (network === bitcoin.networks.testnet) {
-    esploraUrl = 'https://blockstream.info/testnet/api';
-  } else {
-    // Regtest uses local Esplora instance (electrs)
-    esploraUrl = process.env.ESPLORA_API || 'http://localhost:3004';
-  }
-
+  const esploraUrl = getEsploraUrl(network);
   const url = `${esploraUrl}/address/${address}/utxo`;
 
   try {
@@ -329,6 +365,16 @@ async function verifyAndCalculateReserve(attestorUrl: string): Promise<void> {
   console.log(`Total chains: ${data.chains.length}`);
   console.log();
 
+  // Fetch current block height to calculate confirmations
+  const currentBlockHeight = await fetchBlockHeight(network);
+  if (currentBlockHeight !== undefined) {
+    console.log(`Current block height: ${currentBlockHeight}`);
+    console.log(`Minimum confirmations required: 6`);
+  } else {
+    console.warn(`Warning: Could not fetch block height. All confirmed UTXOs will be counted.`);
+  }
+  console.log();
+
   // Counters for summary
   let verifiedCount = 0;
   let failedCount = 0;
@@ -336,6 +382,8 @@ async function verifyAndCalculateReserve(attestorUrl: string): Promise<void> {
 
   let totalBTC = 0;
   let totalUTXOs = 0;
+  let totalUnconfirmedUTXOs = 0;
+  let totalUnconfirmedBTC = 0;
 
   // Step 2: Process each chain (different Canton networks with different signer groups)
   for (const chainGroup of data.chains) {
@@ -372,14 +420,49 @@ async function verifyAndCalculateReserve(attestorUrl: string): Promise<void> {
         // Step 4: Fetch UTXOs from the Bitcoin blockchain
         // This is the actual proof of reserve - checking what BTC exists on-chain
         const utxos = await fetchUTXOs(calculatedAddress, network);
-        const addressValue = utxos.reduce((sum, utxo) => sum + utxo.value, 0);
 
-        totalUTXOs += utxos.length;
+        // Filter UTXOs to only count those with 6+ confirmations
+        const confirmedUtxos = utxos.filter((utxo) => {
+          if (!utxo.status.confirmed) {
+            return false; // Unconfirmed transaction
+          }
+          if (currentBlockHeight === undefined || utxo.status.block_height === undefined) {
+            // If we can't determine confirmations, count all confirmed UTXOs
+            return true;
+          }
+          const confirmations = currentBlockHeight - utxo.status.block_height + 1;
+          return confirmations >= 6;
+        });
+
+        const unconfirmedUtxos = utxos.filter((utxo) => {
+          if (!utxo.status.confirmed) {
+            return true; // Unconfirmed transaction
+          }
+          if (currentBlockHeight === undefined || utxo.status.block_height === undefined) {
+            return false;
+          }
+          const confirmations = currentBlockHeight - utxo.status.block_height + 1;
+          return confirmations < 6;
+        });
+
+        const addressValue = confirmedUtxos.reduce((sum, utxo) => sum + utxo.value, 0);
+        const unconfirmedValue = unconfirmedUtxos.reduce((sum, utxo) => sum + utxo.value, 0);
+
+        totalUTXOs += confirmedUtxos.length;
         totalBTC += addressValue;
+        totalUnconfirmedUTXOs += unconfirmedUtxos.length;
+        totalUnconfirmedBTC += unconfirmedValue;
 
         // Only print addresses that have UTXOs (to reduce noise)
-        if (utxos.length > 0) {
-          console.log(`✅ ${calculatedAddress}: ${utxos.length} UTXOs, ${addressValue / 1e8} BTC`);
+        if (confirmedUtxos.length > 0 || unconfirmedUtxos.length > 0) {
+          const parts = [];
+          if (confirmedUtxos.length > 0) {
+            parts.push(`${confirmedUtxos.length} UTXOs (6+ conf), ${addressValue / 1e8} BTC`);
+          }
+          if (unconfirmedUtxos.length > 0) {
+            parts.push(`${unconfirmedUtxos.length} UTXOs (<6 conf), ${unconfirmedValue / 1e8} BTC`);
+          }
+          console.log(`✅ ${calculatedAddress}: ${parts.join(' | ')}`);
         }
       } catch (error) {
         console.error(`❌ Error processing ${addressInfo.id.substring(0, 16)}...:`, error);
@@ -401,8 +484,13 @@ async function verifyAndCalculateReserve(attestorUrl: string): Promise<void> {
     console.log(`   Failed IDs: ${failedAddresses.map((id) => id.substring(0, 16)).join(', ')}...`);
   }
   console.log();
-  console.log(`Total UTXOs: ${totalUTXOs}`);
-  console.log(`Total BTC in Reserve: ${(totalBTC / 1e8).toFixed(8)} BTC`);
+  console.log(`Confirmed UTXOs (6+ confirmations): ${totalUTXOs}`);
+  console.log(`Total BTC in Reserve (6+ conf): ${(totalBTC / 1e8).toFixed(8)} BTC`);
+  if (totalUnconfirmedUTXOs > 0) {
+    console.log();
+    console.log(`Unconfirmed UTXOs (<6 confirmations): ${totalUnconfirmedUTXOs}`);
+    console.log(`Total BTC pending (<6 conf): ${(totalUnconfirmedBTC / 1e8).toFixed(8)} BTC`);
+  }
   console.log('='.repeat(80));
 
   // Exit with error code if any verification failed
