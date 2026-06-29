@@ -16,6 +16,10 @@
  *
  * Example:
  *   ts-node calculate-bitcoin-addresses.ts http://localhost:8080
+ *
+ * To fetch from the public omnibus passthrough instead of an attestor, set
+ * ADDRESS_CALCULATION_DATA_URL (or run `npm run calculate:mainnet`):
+ *   ADDRESS_CALCULATION_DATA_URL=https://api.mainnet.bitsafe.finance/cbtc/v1/address-calculation-data ts-node calculate-bitcoin-addresses.ts
  */
 
 import * as bitcoin from 'bitcoinjs-lib';
@@ -243,11 +247,17 @@ function calculateTaprootAddress(id: string, xOnlyPubkey: Buffer, network: bitco
  * - All deposit account IDs on each chain
  * - The Bitcoin network (mainnet/testnet/regtest)
  *
- * @param attestorUrl - Base URL of the attestor (e.g., "http://localhost:8080")
+ * @param attestorUrl - Base URL of the attestor (e.g., "http://localhost:8080").
+ *   Ignored when ADDRESS_CALCULATION_DATA_URL is set.
  * @returns API response with chains and addresses
  */
 async function fetchDepositAddresses(attestorUrl: string): Promise<ApiResponse> {
-  const url = `${attestorUrl}/app/get-address-calculation-data`;
+  // Source of the address-calculation data. By default we append the attestor's
+  // /app path to the provided base URL. Set ADDRESS_CALCULATION_DATA_URL to a
+  // full URL to fetch it verbatim instead — e.g. the public omnibus passthrough
+  // at https://api.mainnet.bitsafe.finance/cbtc/v1/address-calculation-data,
+  // which proxies the same data so PoR can run without direct attestor access.
+  const url = process.env.ADDRESS_CALCULATION_DATA_URL || `${attestorUrl}/app/get-address-calculation-data`;
   console.log(`Fetching address calculation data from: ${url}`);
 
   const response = await fetch(url);

@@ -53,8 +53,20 @@ npm run calculate:local
 # Calculate against testnet attestor
 npm run calculate:testnet
 
+# Calculate against mainnet via the public omnibus passthrough
+# (no direct attestor access required)
+npm run calculate:mainnet
+
 # Or specify a custom attestor URL
 npm run calculate http://your-attestor-url:8080
+```
+
+The data source is the attestor's `/app/get-address-calculation-data` endpoint by
+default. To fetch from a full URL instead — such as the public omnibus passthrough
+— set `ADDRESS_CALCULATION_DATA_URL` (this is what `calculate:mainnet` does):
+
+```bash
+ADDRESS_CALCULATION_DATA_URL=https://api.mainnet.bitsafe.finance/cbtc/v1/address-calculation-data npm run calculate
 ```
 
 ### What It Does
@@ -256,6 +268,15 @@ Returns all data needed to independently calculate Bitcoin addresses, grouped by
 ```
 http://ATTESTOR_URL/app/get-address-calculation-data
 ```
+
+**Public passthrough (omnibus):** The same payload is also served, unauthenticated,
+by the omnibus API — useful for running PoR without direct attestor access:
+
+```
+GET https://api.mainnet.bitsafe.finance/cbtc/v1/address-calculation-data
+```
+
+Point the calculator at it via `ADDRESS_CALCULATION_DATA_URL` (or `npm run calculate:mainnet`).
 
 **Purpose**: This endpoint provides the raw data (deposit IDs and xpubs) needed for third parties to independently calculate and verify all Bitcoin addresses. The addresses in the response should NOT be trusted - they are provided only for verification purposes.
 
