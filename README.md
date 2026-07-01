@@ -47,23 +47,27 @@ npm install
 ### Calculate Bitcoin Reserves
 
 ```bash
-# Calculate against local attestor
-npm run calculate:local
+# Calculate reserves against the default endpoint
+npm run calculate
 
-# Calculate against testnet attestor
-npm run calculate:testnet
+# Or point at a different endpoint URL
+npm run calculate https://your-host/cbtc/v1/address-calculation-data
+```
 
-# Or specify a custom attestor URL
-npm run calculate http://your-attestor-url:8080
+The data URL defaults to `https://api.mainnet.bitsafe.finance/cbtc/v1/address-calculation-data`.
+Override it with a CLI argument or the `ADDRESS_CALCULATION_DATA_URL` environment variable:
+
+```bash
+ADDRESS_CALCULATION_DATA_URL=https://your-host/cbtc/v1/address-calculation-data npm run calculate
 ```
 
 ### What It Does
 
 The calculation script:
 
-1. ✅ **Fetches deposit account data** from the attestor API
+1. ✅ **Fetches deposit account data** from the address-calculation endpoint
 2. ✅ **Independently calculates Bitcoin addresses** using the threshold pubkey and deposit IDs
-3. ✅ **Verifies calculated addresses match** what the attestor reports
+3. ✅ **Verifies calculated addresses match** the reported ones
 4. ✅ **Queries the Bitcoin blockchain** (via Esplora) for UTXOs at each address
 5. ✅ **Sums all UTXO values** to calculate total BTC in reserve
 
@@ -73,10 +77,10 @@ The calculation script:
 
 ### Step 1: Get Required Data
 
-Query the attestor API endpoint:
+Query the address-calculation endpoint:
 
 ```bash
-GET /app/get-address-calculation-data
+GET /cbtc/v1/address-calculation-data
 ```
 
 Response format:
@@ -103,18 +107,18 @@ Response format:
 
 - The `xpub` is shared across all addresses in a chain
 - Different Canton chains may use different xpubs (different signer groups)
-- The xpub is **already derived to m/0/0** by the attestor - no additional derivation needed
+- The xpub is **already derived to m/0/0** - no additional derivation needed
 
 ### Step 2: Parse the Extended Public Key (xpub)
 
-The `xpub` field contains the threshold signature group's extended public key **already derived to path m/0/0**. The attestor performs this derivation before returning the xpub. This is a BIP32 extended public key in Base58 format.
+The `xpub` field contains the threshold signature group's extended public key **already derived to path m/0/0**. This is a BIP32 extended public key in Base58 format.
 
 Parse the xpub to extract:
 
 - The public key bytes (33 bytes compressed)
 - The chain code (not used for address calculation, but part of the xpub structure)
 
-**Important:** Do NOT derive the xpub further. The attestor has already derived it to m/0/0, which is the key used for all deposit addresses on this chain.
+**Important:** Do NOT derive the xpub further. It is already derived to m/0/0, which is the key used for all deposit addresses on this chain.
 
 ### Step 3: Convert to X-Only Public Key
 
@@ -221,40 +225,14 @@ See [`calculate-bitcoin-addresses.ts`](./calculate-bitcoin-addresses.ts) for a c
 
 ## API Reference
 
-### GET /app/get-total-cbtc-supply
-
-Returns the current total CBTC supply and last update timestamp.
-
-**Endpoint:**
-
-```
-http://ATTESTOR_URL/app/get-total-cbtc-supply
-```
-
-**Response:**
-
-```json
-{
-  "status": "ready",
-  "total_supply_cbtc": "7.899823260000001",
-  "last_updated": "2025-12-19T17:04:07.328982+00:00"
-}
-```
-
-**Fields:**
-
-- `status`: System status ("ready" indicates the attestor is operational)
-- `total_supply_cbtc`: Total BTC supply backing CBTC (string representation of decimal value)
-- `last_updated`: ISO 8601 timestamp of when the supply was last calculated
-
-### GET /app/get-address-calculation-data
+### GET /cbtc/v1/address-calculation-data
 
 Returns all data needed to independently calculate Bitcoin addresses, grouped by Canton chain, with the threshold xpub for each chain.
 
-**Endpoint:**
+Default endpoint:
 
 ```
-http://ATTESTOR_URL/app/get-address-calculation-data
+GET https://api.mainnet.bitsafe.finance/cbtc/v1/address-calculation-data
 ```
 
 **Purpose**: This endpoint provides the raw data (deposit IDs and xpubs) needed for third parties to independently calculate and verify all Bitcoin addresses. The addresses in the response should NOT be trusted - they are provided only for verification purposes.
@@ -286,10 +264,10 @@ http://ATTESTOR_URL/app/get-address-calculation-data
   - `xpub`: BIP32 extended public key for this signer group (already derived to m/0/0)
   - `addresses`: Array of deposit accounts on this chain
     - `id`: Deposit account ID (hex string)
-    - `address_for_verification`: Bitcoin address provided by attestor (DO NOT TRUST - must be independently calculated and verified!)
+    - `address_for_verification`: Reported Bitcoin address (DO NOT TRUST - must be independently calculated and verified!)
 - `bitcoin_network`: Bitcoin network ("mainnet", "testnet", "regtest")
 
-**Important:** The script **does not trust** the `address_for_verification` field. It independently calculates each address and verifies it matches. This prevents the attestor from providing incorrect addresses.
+**Important:** The script **does not trust** the `address_for_verification` field. It independently calculates each address and verifies it matches. This prevents the data source from providing incorrect addresses.
 
 ---
 
@@ -297,17 +275,17 @@ http://ATTESTOR_URL/app/get-address-calculation-data
 
 To verify the bridge's Bitcoin holdings:
 
-1. **Fetch all deposit data** from `/get-address-calculation-data`
+1. **Fetch all deposit data** from the address-calculation endpoint
 2. **For each chain**, use the already-derived `xpub` to independently calculate addresses
-3. **Verify calculated addresses match** the ones provided by the attestor
+3. **Verify calculated addresses match** the reported ones
 4. **Query Bitcoin blockchain** (via Esplora, Electrum, or Bitcoin Core) for UTXOs at each address
 5. **Sum all UTXO values** to get total BTC in the bridge
 
 This ensures:
 
 - ✅ Addresses are correctly derived from the threshold pubkey
-- ✅ No addresses can be excluded or added by the attestor
-- ✅ UTXO data comes from the Bitcoin blockchain, not the attestor
+- ✅ No addresses can be excluded or added
+- ✅ UTXO data comes from the Bitcoin blockchain, not the data source
 - ✅ Complete trustless verification of proof of reserves
 
 ## Example Output
