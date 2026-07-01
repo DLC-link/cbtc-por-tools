@@ -4,10 +4,7 @@
   "description": "Bitcoin address calculation and proof of reserve calculator for CBTC bridge",
   "main": "calculate-bitcoin-addresses.ts",
   "scripts": {
-    "calculate": "ts-node calculate-bitcoin-addresses.ts",
-    "calculate:local": "ts-node calculate-bitcoin-addresses.ts http://localhost:8080",
-    "calculate:testnet": "ts-node calculate-bitcoin-addresses.ts https://testnet-attestor.dlc.link",
-    "calculate:mainnet": "ADDRESS_CALCULATION_DATA_URL=https://api.mainnet.bitsafe.finance/cbtc/v1/address-calculation-data ts-node calculate-bitcoin-addresses.ts"
+    "calculate": "ts-node calculate-bitcoin-addresses.ts"
   },
   "dependencies": {
     "bip32": "^4.0.0",

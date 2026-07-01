@@ -6,20 +6,17 @@
  * This script independently calculates Bitcoin deposit addresses for the CBTC bridge
  * and sums all UTXOs to verify the total BTC held in reserve.
  *
- * The key principle is TRUSTLESSNESS - we never trust the attestor's provided addresses.
+ * The key principle is TRUSTLESSNESS - we never trust the reported addresses.
  * Instead, we independently calculate every address from the threshold public key
- * and deposit account IDs, then verify they match what the attestor reports.
+ * and deposit account IDs, then verify they match what the endpoint reports.
  *
  * Usage:
- *   npm install bitcoinjs-lib bip32 tiny-secp256k1 @types/node ts-node typescript
- *   ts-node calculate-bitcoin-addresses.ts <attestor_url>
+ *   npm install
+ *   npm run calculate                # uses the default endpoint
+ *   npm run calculate <data_url>     # or a custom endpoint URL
  *
- * Example:
- *   ts-node calculate-bitcoin-addresses.ts http://localhost:8080
- *
- * To fetch from the public omnibus passthrough instead of an attestor, set
- * ADDRESS_CALCULATION_DATA_URL (or run `npm run calculate:mainnet`):
- *   ADDRESS_CALCULATION_DATA_URL=https://api.mainnet.bitsafe.finance/cbtc/v1/address-calculation-data ts-node calculate-bitcoin-addresses.ts
+ * The data URL defaults to DEFAULT_DATA_URL below and can be overridden with a
+ * CLI argument or the ADDRESS_CALCULATION_DATA_URL environment variable.
  */
 
 import * as bitcoin from 'bitcoinjs-lib';
@@ -32,6 +29,10 @@ bitcoin.initEccLib(ecc);
 
 // Initialize BIP32 library with elliptic curve implementation
 const bip32 = BIP32Factory(ecc);
+
+// Default address-calculation data endpoint. Override with a CLI argument or
+// the ADDRESS_CALCULATION_DATA_URL environment variable.
+const DEFAULT_DATA_URL = 'https://api.mainnet.bitsafe.finance/cbtc/v1/address-calculation-data';
 
 /**
  * Constants from the Rust implementation
@@ -239,29 +240,15 @@ function calculateTaprootAddress(id: string, xOnlyPubkey: Buffer, network: bitco
 }
 
 /**
- * Fetch all deposit addresses from the attestor API
+ * Fetch the address-calculation data (chains, xpubs, deposit IDs, network).
  *
- * This queries the attestor to get:
- * - All Canton chains (different signer groups)
- * - The xpub for each chain (threshold group public key)
- * - All deposit account IDs on each chain
- * - The Bitcoin network (mainnet/testnet/regtest)
- *
- * @param attestorUrl - Base URL of the attestor (e.g., "http://localhost:8080").
- *   Ignored when ADDRESS_CALCULATION_DATA_URL is set.
+ * @param dataUrl - Full URL of the address-calculation data endpoint
  * @returns API response with chains and addresses
  */
-async function fetchDepositAddresses(attestorUrl: string): Promise<ApiResponse> {
-  // Source of the address-calculation data. By default we append the attestor's
-  // /app path to the provided base URL. Set ADDRESS_CALCULATION_DATA_URL to a
-  // full URL to fetch it verbatim instead — e.g. the public omnibus passthrough
-  // at https://api.mainnet.bitsafe.finance/cbtc/v1/address-calculation-data,
-  // which proxies the same data so PoR can run without direct attestor access.
-  const url = process.env.ADDRESS_CALCULATION_DATA_URL || `${attestorUrl}/app/get-address-calculation-data`;
-  console.log(`Fetching address calculation data from: ${url}`);
+async function fetchDepositAddresses(dataUrl: string): Promise<ApiResponse> {
+  console.log(`Fetching address calculation data from: ${dataUrl}`);
 
-  const response = await fetch(url);
-
+  const response = await fetch(dataUrl);
   if (!response.ok) {
     throw new Error(`HTTP error! status: ${response.status}`);
   }
@@ -350,25 +337,25 @@ async function fetchUTXOs(address: string, network: bitcoin.Network): Promise<UT
  * Main verification and calculation function
  *
  * This is the entry point that:
- * 1. Fetches deposit account data from the attestor
+ * 1. Fetches deposit account data
  * 2. Independently calculates each Bitcoin address
- * 3. Verifies calculated addresses match what the attestor reports
+ * 3. Verifies calculated addresses match the reported ones
  * 4. Queries the Bitcoin blockchain for UTXOs
  * 5. Sums all UTXO values to get total BTC in reserve
  *
- * The key security property is that we NEVER trust the attestor's addresses.
+ * The key security property is that we NEVER trust the reported addresses.
  * We always recalculate them from the threshold pubkey and deposit IDs.
  *
- * @param attestorUrl - Base URL of the attestor API
+ * @param dataUrl - Full URL of the address-calculation data endpoint
  */
-async function verifyAndCalculateReserve(attestorUrl: string): Promise<void> {
+async function verifyAndCalculateReserve(dataUrl: string = DEFAULT_DATA_URL): Promise<void> {
   console.log('='.repeat(80));
   console.log('Bitcoin Address Calculation and Proof of Reserve');
   console.log('='.repeat(80));
   console.log();
 
-  // Step 1: Fetch all deposit account data from the attestor
-  const data = await fetchDepositAddresses(attestorUrl);
+  // Step 1: Fetch all deposit account data
+  const data = await fetchDepositAddresses(dataUrl);
   const network = getBitcoinNetwork(data.bitcoin_network);
 
   console.log(`Network: ${data.bitcoin_network}`);
@@ -411,15 +398,15 @@ async function verifyAndCalculateReserve(attestorUrl: string): Promise<void> {
     for (const addressInfo of chainGroup.addresses) {
       try {
         // **CRITICAL STEP**: Calculate the address independently
-        // We NEVER trust the attestor's provided address
+        // We NEVER trust the reported address
         const calculatedAddress = calculateTaprootAddress(addressInfo.id, xOnlyPubkey, network);
 
-        // Verify our calculated address matches what the attestor reported
-        // If it doesn't match, the attestor is either broken or malicious
+        // Verify our calculated address matches the reported one
+        // If it doesn't match, the data source is either broken or malicious
         if (calculatedAddress !== addressInfo.address_for_verification) {
           console.error(`❌ Address mismatch for ID ${addressInfo.id.substring(0, 16)}...`);
-          console.error(`   Attestor provided: ${addressInfo.address_for_verification}`);
-          console.error(`   We calculated:     ${calculatedAddress}`);
+          console.error(`   Reported:   ${addressInfo.address_for_verification}`);
+          console.error(`   Calculated: ${calculatedAddress}`);
           failedCount++;
           failedAddresses.push(addressInfo.id);
           continue;
@@ -511,10 +498,10 @@ async function verifyAndCalculateReserve(attestorUrl: string): Promise<void> {
 
 // Main execution
 if (require.main === module) {
-  // Get attestor URL from command line argument or use default
-  const attestorUrl = process.argv[2] || 'http://localhost:8080';
+  // Resolve the data URL: CLI argument, then env var, then the default.
+  const dataUrl = process.argv[2] || process.env.ADDRESS_CALCULATION_DATA_URL || DEFAULT_DATA_URL;
 
-  verifyAndCalculateReserve(attestorUrl)
+  verifyAndCalculateReserve(dataUrl)
     .then(() => {
       console.log('✅ Verification complete!');
       process.exit(0);
