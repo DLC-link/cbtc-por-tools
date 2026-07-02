@@ -39,7 +39,7 @@ Traditional "Proof of Reserve" systems require trusting the bridge operator to p
 ### Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/cbtc-por-tools.git
+git clone https://github.com/DLC-link/cbtc-por-tools.git
 cd cbtc-por-tools
 npm install
 ```
@@ -60,6 +60,21 @@ Override it with a CLI argument or the `ADDRESS_CALCULATION_DATA_URL` environmen
 ```bash
 ADDRESS_CALCULATION_DATA_URL=https://your-host/cbtc/v1/address-calculation-data npm run calculate
 ```
+
+### Configuration
+
+The tool talks to **two** external services. Both have working defaults, so `npm run calculate` runs against mainnet out of the box — but each can be overridden.
+
+| Service | Purpose | Default | How to override |
+| --- | --- | --- | --- |
+| **Address-calculation data** | Deposit account IDs + threshold xpubs used to derive the addresses | `https://api.mainnet.bitsafe.finance/cbtc/v1/address-calculation-data` | CLI argument, or `ADDRESS_CALCULATION_DATA_URL` |
+| **Esplora Bitcoin API** | On-chain UTXO lookups — the actual reserve check | `https://blockstream.info/api` (mainnet), `https://blockstream.info/testnet/api` (testnet), `http://localhost:3004` (regtest) | `ESPLORA_API` |
+
+> **Note:** the public Blockstream Esplora endpoints are rate limited. For a full mainnet run (hundreds of addresses) or any production use, point `ESPLORA_API` at your own Esplora / electrs instance:
+>
+> ```bash
+> ESPLORA_API=https://your-esplora.example.com/api npm run calculate
+> ```
 
 ### What It Does
 
@@ -295,23 +310,32 @@ This ensures:
 Bitcoin Address Calculation and Proof of Reserve
 ================================================================================
 
-Network: testnet
-Total deposit accounts: 42
+Fetching address calculation data from: https://api.mainnet.bitsafe.finance/cbtc/v1/address-calculation-data
+Network: bitcoin
+Total chains: 1
 
-Chain: devnet (xpub: tpubD6NzVbkrYhZ4...)
-✅ tb1p3xk2...: 2 UTXOs, 0.5 BTC
-✅ tb1p7ym9...: 1 UTXO, 1.2 BTC
-✅ tb1pqrs4...: 3 UTXOs, 0.8 BTC
+Current block height: 956372
+Minimum confirmations required: 6
+
+Chain: canton-mainnet (xpub: xpub6GRcASRzGcNL...)
+✅ bc1p49rj3gggtfg39hh06wcjrt3z6yp2jljywusdudcclwyq6swrm5hq9wyhue: 1 UTXOs (6+ conf), 0.02113583 BTC
+✅ bc1pau3r8a200zcpn6fyfeyftr0h2fg6auwvh804cfvp8wm0ezfc4a0sczc4rr: 1 UTXOs (6+ conf), 0.998754 BTC
 
 ================================================================================
 Summary
 ================================================================================
-✅ Verified addresses: 42/42
+✅ Verified addresses: 724/724
 
-Total UTXOs: 156
-Total BTC in Reserve: 12.34567890 BTC
+Confirmed UTXOs (6+ confirmations): 279
+Total BTC in Reserve (6+ conf): 36.29359756 BTC
 ================================================================================
+✅ Verification complete!
 ```
+
+Only addresses that currently hold UTXOs are printed, so most of the run is
+silent progress; the summary line reports the verified total either way. An
+address with an unconfirmed deposit is reported separately, e.g.
+`1 UTXOs (<6 conf), 0.00100000 BTC`, and counted as pending rather than reserve.
 
 ---
 
