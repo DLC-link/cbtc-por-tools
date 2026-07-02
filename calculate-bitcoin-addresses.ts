@@ -248,12 +248,31 @@ function calculateTaprootAddress(id: string, xOnlyPubkey: Buffer, network: bitco
 async function fetchDepositAddresses(dataUrl: string): Promise<ApiResponse> {
   console.log(`Fetching address calculation data from: ${dataUrl}`);
 
-  const response = await fetch(dataUrl);
-  if (!response.ok) {
-    throw new Error(`HTTP error! status: ${response.status}`);
+  // Network-level failure (bad host, no connectivity, TLS error, etc.)
+  let response: Response;
+  try {
+    response = await fetch(dataUrl);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`Could not reach the address-calculation endpoint at ${dataUrl} (${reason}). Check the URL and your network connection.`);
   }
 
-  return (await response.json()) as ApiResponse;
+  if (!response.ok) {
+    throw new Error(`The address-calculation endpoint at ${dataUrl} returned HTTP ${response.status}. Check that the URL is correct.`);
+  }
+
+  // Guard against a non-JSON body (e.g. a redirect to an HTML page): the raw
+  // JSON.parse error is cryptic, so surface a clear, actionable message instead.
+  const body = await response.text();
+  try {
+    return JSON.parse(body) as ApiResponse;
+  } catch {
+    const preview = body.slice(0, 80).replace(/\s+/g, ' ').trim();
+    throw new Error(
+      `The address-calculation endpoint at ${dataUrl} did not return valid JSON (got: "${preview}..."). ` +
+        `Make sure the URL points at the address-calculation-data API, not a web page.`
+    );
+  }
 }
 
 /**
@@ -358,8 +377,13 @@ async function verifyAndCalculateReserve(dataUrl: string = DEFAULT_DATA_URL): Pr
   const data = await fetchDepositAddresses(dataUrl);
   const network = getBitcoinNetwork(data.bitcoin_network);
 
+  // Total deposit accounts across all chains — also used to report progress
+  // during the (potentially long) per-address on-chain lookups below.
+  const totalAddresses = data.chains.reduce((sum, chainGroup) => sum + chainGroup.addresses.length, 0);
+
   console.log(`Network: ${data.bitcoin_network}`);
   console.log(`Total chains: ${data.chains.length}`);
+  console.log(`Total deposit accounts: ${totalAddresses}`);
   console.log();
 
   // Fetch current block height to calculate confirmations
@@ -382,6 +406,12 @@ async function verifyAndCalculateReserve(dataUrl: string = DEFAULT_DATA_URL): Pr
   let totalUnconfirmedUTXOs = 0;
   let totalUnconfirmedBTC = 0;
 
+  // Progress tracking: the per-address on-chain lookups are sequential and can
+  // take minutes, and only funded addresses print a line — so emit a periodic
+  // heartbeat to make it obvious the run is still working, not hung.
+  let processed = 0;
+  const PROGRESS_INTERVAL = 50;
+
   // Step 2: Process each chain (different Canton networks with different signer groups)
   for (const chainGroup of data.chains) {
     console.log(`Chain: ${chainGroup.chain} (xpub: ${chainGroup.xpub.substring(0, 20)}...)`);
@@ -396,6 +426,10 @@ async function verifyAndCalculateReserve(dataUrl: string = DEFAULT_DATA_URL): Pr
 
     // Step 3: Process each deposit account on this chain
     for (const addressInfo of chainGroup.addresses) {
+      processed++;
+      if (processed % PROGRESS_INTERVAL === 0 || processed === totalAddresses) {
+        console.log(`  …progress: ${processed}/${totalAddresses} deposit accounts processed`);
+      }
       try {
         // **CRITICAL STEP**: Calculate the address independently
         // We NEVER trust the reported address
@@ -507,7 +541,8 @@ if (require.main === module) {
       process.exit(0);
     })
     .catch((error) => {
-      console.error('❌ Verification failed:', error);
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`❌ Verification failed: ${message}`);
       process.exit(1);
     });
 }
