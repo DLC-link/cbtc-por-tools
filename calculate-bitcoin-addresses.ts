@@ -281,24 +281,67 @@ function getEsploraUrl(network: bitcoin.Network): string {
 }
 
 /**
+ * Sleep for the given number of milliseconds.
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Fetch a URL and parse the body as JSON, retrying on transient failures.
+ *
+ * Public Esplora endpoints are rate limited and occasionally return transient
+ * 5xx errors or drop the connection. A single failure must NEVER be silently
+ * treated as "no data" — for a proof-of-reserve tool, silently mapping a failed
+ * UTXO lookup to "zero balance" would understate the reserve. So we retry with
+ * exponential backoff and, if every attempt fails, throw so the caller can
+ * record the failure explicitly instead of counting the address as empty.
+ *
+ * @param url - URL to fetch
+ * @param attempts - Maximum number of attempts (default 4)
+ * @returns Parsed JSON body
+ * @throws If all attempts fail (non-2xx status or network error)
+ */
+async function fetchJsonWithRetry(url: string, attempts = 4): Promise<unknown> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      return await response.json();
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) {
+        // Exponential backoff: 500ms, 1s, 2s, ...
+        await sleep(500 * 2 ** (attempt - 1));
+      }
+    }
+  }
+  const reason = lastError instanceof Error ? lastError.message : String(lastError);
+  throw new Error(`failed after ${attempts} attempts (${reason})`);
+}
+
+/**
  * Fetch current block height from Esplora API
  *
+ * Block height is non-fatal: without it we cannot compute confirmations, so the
+ * caller falls back to counting all confirmed UTXOs. We still retry transient
+ * failures before giving up.
+ *
  * @param network - Bitcoin network configuration
- * @returns Current block height, or undefined if fetch fails
+ * @returns Current block height, or undefined if it cannot be fetched
  */
 async function fetchBlockHeight(network: bitcoin.Network): Promise<number | undefined> {
   const esploraUrl = getEsploraUrl(network);
   const url = `${esploraUrl}/blocks/tip/height`;
 
   try {
-    const response = await fetch(url);
-    if (!response.ok) {
-      console.warn(`Failed to fetch block height: ${response.status}`);
-      return undefined;
-    }
-    return (await response.json()) as number;
+    return (await fetchJsonWithRetry(url)) as number;
   } catch (error) {
-    console.warn(`Error fetching block height:`, error);
+    const reason = error instanceof Error ? error.message : String(error);
+    console.warn(`Warning: could not fetch block height (${reason}).`);
     return undefined;
   }
 }
@@ -315,22 +358,14 @@ async function fetchBlockHeight(network: bitcoin.Network): Promise<number | unde
  * @param address - Bitcoin address (P2TR/Bech32m format)
  * @param network - Bitcoin network configuration
  * @returns Array of UTXOs at this address
+ * @throws If UTXOs cannot be fetched after retries. Callers MUST treat this as
+ *   "reserve unknown for this address", never as "zero balance" — otherwise the
+ *   reported reserve would be silently understated.
  */
 async function fetchUTXOs(address: string, network: bitcoin.Network): Promise<UTXO[]> {
   const esploraUrl = getEsploraUrl(network);
   const url = `${esploraUrl}/address/${address}/utxo`;
-
-  try {
-    const response = await fetch(url);
-    if (!response.ok) {
-      console.warn(`Failed to fetch UTXOs for ${address}: ${response.status}`);
-      return [];
-    }
-    return (await response.json()) as UTXO[];
-  } catch (error) {
-    console.warn(`Error fetching UTXOs for ${address}:`, error);
-    return [];
-  }
+  return (await fetchJsonWithRetry(url)) as UTXO[];
 }
 
 /**
@@ -377,6 +412,11 @@ async function verifyAndCalculateReserve(dataUrl: string = DEFAULT_DATA_URL): Pr
   let failedCount = 0;
   const failedAddresses: string[] = [];
 
+  // Addresses whose derivation was verified but whose on-chain UTXOs could not
+  // be fetched (e.g. Esplora outage/rate limit). These are NOT counted as zero
+  // balance — they make the reserve total a lower bound and fail the run.
+  const unfetchableAddresses: string[] = [];
+
   let totalBTC = 0;
   let totalUTXOs = 0;
   let totalUnconfirmedUTXOs = 0;
@@ -415,8 +455,19 @@ async function verifyAndCalculateReserve(dataUrl: string = DEFAULT_DATA_URL): Pr
         verifiedCount++;
 
         // Step 4: Fetch UTXOs from the Bitcoin blockchain
-        // This is the actual proof of reserve - checking what BTC exists on-chain
-        const utxos = await fetchUTXOs(calculatedAddress, network);
+        // This is the actual proof of reserve - checking what BTC exists on-chain.
+        // If the lookup fails after retries we must NOT treat the address as
+        // holding zero BTC — that would silently understate the reserve. Record
+        // it as unfetchable, keep processing the rest, and fail the run at the end.
+        let utxos: UTXO[];
+        try {
+          utxos = await fetchUTXOs(calculatedAddress, network);
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          console.error(`⚠️  Could not fetch UTXOs for ${calculatedAddress}: ${reason}`);
+          unfetchableAddresses.push(calculatedAddress);
+          continue;
+        }
 
         // Filter UTXOs to only count those with 6+ confirmations
         const confirmedUtxos = utxos.filter((utxo) => {
@@ -488,10 +539,18 @@ async function verifyAndCalculateReserve(dataUrl: string = DEFAULT_DATA_URL): Pr
     console.log(`Unconfirmed UTXOs (<6 confirmations): ${totalUnconfirmedUTXOs}`);
     console.log(`Total BTC pending (<6 conf): ${(totalUnconfirmedBTC / 1e8).toFixed(8)} BTC`);
   }
+  if (unfetchableAddresses.length > 0) {
+    console.log();
+    console.log(`⚠️  Could not fetch on-chain data for ${unfetchableAddresses.length} verified address(es) after retries.`);
+    console.log(`   The reserve total above is a LOWER BOUND — these addresses are excluded, not counted as zero.`);
+    console.log(`   Affected: ${unfetchableAddresses.map((a) => a.substring(0, 16)).join(', ')}...`);
+  }
   console.log('='.repeat(80));
 
-  // Exit with error code if any verification failed
-  if (failedCount > 0) {
+  // Exit with an error code if any address failed verification, or if we could
+  // not obtain complete on-chain data (an incomplete reserve total must never
+  // be reported as a clean success).
+  if (failedCount > 0 || unfetchableAddresses.length > 0) {
     process.exit(1);
   }
 }
