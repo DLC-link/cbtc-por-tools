@@ -412,11 +412,6 @@ async function verifyAndCalculateReserve(dataUrl: string = DEFAULT_DATA_URL): Pr
   let failedCount = 0;
   const failedAddresses: string[] = [];
 
-  // Addresses whose derivation was verified but whose on-chain UTXOs could not
-  // be fetched (e.g. Esplora outage/rate limit). These are NOT counted as zero
-  // balance — they make the reserve total a lower bound and fail the run.
-  const unfetchableAddresses: string[] = [];
-
   let totalBTC = 0;
   let totalUTXOs = 0;
   let totalUnconfirmedUTXOs = 0;
@@ -456,17 +451,21 @@ async function verifyAndCalculateReserve(dataUrl: string = DEFAULT_DATA_URL): Pr
 
         // Step 4: Fetch UTXOs from the Bitcoin blockchain
         // This is the actual proof of reserve - checking what BTC exists on-chain.
-        // If the lookup fails after retries we must NOT treat the address as
-        // holding zero BTC — that would silently understate the reserve. Record
-        // it as unfetchable, keep processing the rest, and fail the run at the end.
+        // fetchUTXOs already retries transient failures with backoff. If it still
+        // fails, we cannot read this address's balance — so we abort the entire
+        // run rather than skip it or count it as zero. A proof-of-reserve total is
+        // only meaningful if it covers every address; a partial total would be
+        // misleading, so we report none.
         let utxos: UTXO[];
         try {
           utxos = await fetchUTXOs(calculatedAddress, network);
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error);
-          console.error(`⚠️  Could not fetch UTXOs for ${calculatedAddress}: ${reason}`);
-          unfetchableAddresses.push(calculatedAddress);
-          continue;
+          console.error();
+          console.error(`❌ Could not read on-chain UTXOs for ${calculatedAddress} after retries (${reason}).`);
+          console.error(`   Aborting without a reserve total — a complete on-chain read is required for a`);
+          console.error(`   trustworthy result. Check your Esplora endpoint (ESPLORA_API) and re-run.`);
+          process.exit(1);
         }
 
         // Filter UTXOs to only count those with 6+ confirmations
@@ -539,18 +538,12 @@ async function verifyAndCalculateReserve(dataUrl: string = DEFAULT_DATA_URL): Pr
     console.log(`Unconfirmed UTXOs (<6 confirmations): ${totalUnconfirmedUTXOs}`);
     console.log(`Total BTC pending (<6 conf): ${(totalUnconfirmedBTC / 1e8).toFixed(8)} BTC`);
   }
-  if (unfetchableAddresses.length > 0) {
-    console.log();
-    console.log(`⚠️  Could not fetch on-chain data for ${unfetchableAddresses.length} verified address(es) after retries.`);
-    console.log(`   The reserve total above is a LOWER BOUND — these addresses are excluded, not counted as zero.`);
-    console.log(`   Affected: ${unfetchableAddresses.map((a) => a.substring(0, 16)).join(', ')}...`);
-  }
   console.log('='.repeat(80));
 
-  // Exit with an error code if any address failed verification, or if we could
-  // not obtain complete on-chain data (an incomplete reserve total must never
-  // be reported as a clean success).
-  if (failedCount > 0 || unfetchableAddresses.length > 0) {
+  // Exit with an error code if any address failed verification. (A UTXO lookup
+  // that fails after retries aborts the run earlier, before this summary, so an
+  // incomplete reserve total is never printed.)
+  if (failedCount > 0) {
     process.exit(1);
   }
 }
