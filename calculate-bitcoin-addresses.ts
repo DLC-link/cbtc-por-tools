@@ -84,6 +84,22 @@ interface UTXO {
 }
 
 /**
+ * Thrown when a complete, trustworthy reserve total cannot be produced — either
+ * an address's on-chain UTXOs could not be read, or one or more addresses failed
+ * independent verification.
+ *
+ * verifyAndCalculateReserve throws this instead of calling process.exit, so it is
+ * safe to use as a library: consumers can catch it. Only the CLI entrypoint turns
+ * it into a non-zero exit code.
+ */
+class ReserveVerificationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ReserveVerificationError';
+  }
+}
+
+/**
  * Hash a string using SHA-256
  *
  * This is used to derive the chain code for the unspendable key from the deposit ID.
@@ -254,11 +270,11 @@ async function fetchDepositAddresses(dataUrl: string): Promise<ApiResponse> {
     response = await fetch(dataUrl);
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    throw new Error(`Could not reach the address-calculation endpoint at ${dataUrl} (${reason}). Check the URL and your network connection.`);
+    throw new ReserveVerificationError(`Could not reach the address-calculation endpoint at ${dataUrl} (${reason}). Check the URL and your network connection.`);
   }
 
   if (!response.ok) {
-    throw new Error(`The address-calculation endpoint at ${dataUrl} returned HTTP ${response.status}. Check that the URL is correct.`);
+    throw new ReserveVerificationError(`The address-calculation endpoint at ${dataUrl} returned HTTP ${response.status}. Check that the URL is correct.`);
   }
 
   // Guard against a non-JSON body (e.g. a redirect to an HTML page): the raw
@@ -272,7 +288,7 @@ async function fetchDepositAddresses(dataUrl: string): Promise<ApiResponse> {
     // and JSON.stringify the preview so embedded quotes (common in HTML) are
     // escaped rather than confusing the message.
     const preview = body.length > 80 ? `${snippet}…` : snippet;
-    throw new Error(
+    throw new ReserveVerificationError(
       `The address-calculation endpoint at ${dataUrl} did not return valid JSON (got: ${JSON.stringify(preview)}). ` +
         `Make sure the URL points at the address-calculation-data API, not a web page.`
     );
@@ -304,24 +320,103 @@ function getEsploraUrl(network: bitcoin.Network): string {
 }
 
 /**
+ * Sleep for the given number of milliseconds.
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Per-attempt network timeout. Node's fetch has no default timeout, so a stalled
+// connection (e.g. a firewall silently dropping packets) could hang forever and
+// defeat the fail-fast intent. Each attempt is bounded; a timeout counts as a
+// transient failure and is retried.
+const FETCH_TIMEOUT_MS = 15_000;
+
+/**
+ * Fetch a URL and parse the body as JSON, retrying on transient failures.
+ *
+ * Public Esplora endpoints are rate limited and occasionally return transient
+ * 5xx errors or drop the connection. A single failure must NEVER be silently
+ * treated as "no data" — for a proof-of-reserve tool, silently mapping a failed
+ * UTXO lookup to "zero balance" would understate the reserve. So we retry with
+ * exponential backoff and, if every attempt fails, throw so the caller can
+ * record the failure explicitly instead of counting the address as empty.
+ *
+ * Only transient failures are retried: network-level errors and the HTTP
+ * statuses worth retrying (`429 Too Many Requests` and `5xx`). Other 4xx
+ * responses (e.g. 400/404) are client errors that will not succeed on retry, so
+ * they fail immediately rather than waiting through the backoff (which would
+ * also worsen rate limiting).
+ *
+ * @param url - URL to fetch
+ * @param attempts - Maximum number of attempts (default 4)
+ * @returns Parsed JSON body
+ * @throws Immediately on a non-transient (non-429 4xx) response, or after all
+ *   attempts are exhausted on transient failures.
+ */
+async function fetchJsonWithRetry(url: string, attempts = 4): Promise<unknown> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    let response: Response;
+    try {
+      response = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+    } catch (error) {
+      // Network-level failure (DNS, connection reset, TLS, or timeout) — transient, retry.
+      lastError = error;
+      if (attempt < attempts) {
+        await sleep(500 * 2 ** (attempt - 1)); // Exponential backoff: 500ms, 1s, 2s, ...
+      }
+      continue;
+    }
+
+    if (response.ok) {
+      return await response.json();
+    }
+
+    // Non-2xx response. Release the unread body first: in Node's fetch (undici)
+    // an undrained body can block connection reuse and leak sockets across the
+    // many requests/retries a full run makes.
+    await response.body?.cancel();
+
+    // Retry only transient statuses (429 or 5xx); other 4xx are client errors
+    // that will not succeed on retry, so fail immediately.
+    lastError = new Error(`HTTP ${response.status} ${response.statusText} for ${url}`);
+    const transient = response.status === 429 || response.status >= 500;
+    if (!transient) {
+      throw lastError;
+    }
+    if (attempt < attempts) {
+      // Honor a numeric Retry-After (seconds) when the server sends one, capped
+      // at 30s; otherwise fall back to exponential backoff (500ms, 1s, 2s, ...).
+      const retryAfter = Number(response.headers.get('retry-after'));
+      const delayMs =
+        Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter * 1000, 30_000) : 500 * 2 ** (attempt - 1);
+      await sleep(delayMs);
+    }
+  }
+  const reason = lastError instanceof Error ? lastError.message : String(lastError);
+  throw new Error(`failed to fetch ${url} after ${attempts} attempts (${reason})`);
+}
+
+/**
  * Fetch current block height from Esplora API
  *
+ * Block height is non-fatal: without it we cannot compute confirmations, so the
+ * caller falls back to counting all confirmed UTXOs. We still retry transient
+ * failures before giving up.
+ *
  * @param network - Bitcoin network configuration
- * @returns Current block height, or undefined if fetch fails
+ * @returns Current block height, or undefined if it cannot be fetched
  */
 async function fetchBlockHeight(network: bitcoin.Network): Promise<number | undefined> {
   const esploraUrl = getEsploraUrl(network);
   const url = `${esploraUrl}/blocks/tip/height`;
 
   try {
-    const response = await fetch(url);
-    if (!response.ok) {
-      console.warn(`Failed to fetch block height: ${response.status}`);
-      return undefined;
-    }
-    return (await response.json()) as number;
-  } catch (error) {
-    console.warn(`Error fetching block height:`, error);
+    return (await fetchJsonWithRetry(url)) as number;
+  } catch {
+    // Non-fatal, and intentionally silent: the caller owns the single
+    // user-facing warning and falls back to counting all confirmed UTXOs.
     return undefined;
   }
 }
@@ -338,22 +433,14 @@ async function fetchBlockHeight(network: bitcoin.Network): Promise<number | unde
  * @param address - Bitcoin address (P2TR/Bech32m format)
  * @param network - Bitcoin network configuration
  * @returns Array of UTXOs at this address
+ * @throws If UTXOs cannot be fetched after retries. Callers MUST treat this as
+ *   "reserve unknown for this address", never as "zero balance" — otherwise the
+ *   reported reserve would be silently understated.
  */
 async function fetchUTXOs(address: string, network: bitcoin.Network): Promise<UTXO[]> {
   const esploraUrl = getEsploraUrl(network);
   const url = `${esploraUrl}/address/${address}/utxo`;
-
-  try {
-    const response = await fetch(url);
-    if (!response.ok) {
-      console.warn(`Failed to fetch UTXOs for ${address}: ${response.status}`);
-      return [];
-    }
-    return (await response.json()) as UTXO[];
-  } catch (error) {
-    console.warn(`Error fetching UTXOs for ${address}:`, error);
-    return [];
-  }
+  return (await fetchJsonWithRetry(url)) as UTXO[];
 }
 
 /**
@@ -434,75 +521,95 @@ async function verifyAndCalculateReserve(dataUrl: string = DEFAULT_DATA_URL): Pr
       if (processed % PROGRESS_INTERVAL === 0 || processed === totalAddresses) {
         console.log(`  …progress: ${processed}/${totalAddresses} deposit accounts processed`);
       }
+
+      // **CRITICAL STEP**: Calculate the address independently (we NEVER trust
+      // the reported address). A calculation error is specific to this account —
+      // record it and keep going; it does not invalidate the rest of the run.
+      let calculatedAddress: string;
       try {
-        // **CRITICAL STEP**: Calculate the address independently
-        // We NEVER trust the reported address
-        const calculatedAddress = calculateTaprootAddress(addressInfo.id, xOnlyPubkey, network);
-
-        // Verify our calculated address matches the reported one
-        // If it doesn't match, the data source is either broken or malicious
-        if (calculatedAddress !== addressInfo.address_for_verification) {
-          console.error(`❌ Address mismatch for ID ${addressInfo.id.substring(0, 16)}...`);
-          console.error(`   Reported:   ${addressInfo.address_for_verification}`);
-          console.error(`   Calculated: ${calculatedAddress}`);
-          failedCount++;
-          failedAddresses.push(addressInfo.id);
-          continue;
-        }
-
-        verifiedCount++;
-
-        // Step 4: Fetch UTXOs from the Bitcoin blockchain
-        // This is the actual proof of reserve - checking what BTC exists on-chain
-        const utxos = await fetchUTXOs(calculatedAddress, network);
-
-        // Filter UTXOs to only count those with 6+ confirmations
-        const confirmedUtxos = utxos.filter((utxo) => {
-          if (!utxo.status.confirmed) {
-            return false; // Unconfirmed transaction
-          }
-          if (currentBlockHeight === undefined || utxo.status.block_height === undefined) {
-            // If we can't determine confirmations, count all confirmed UTXOs
-            return true;
-          }
-          const confirmations = currentBlockHeight - utxo.status.block_height + 1;
-          return confirmations >= 6;
-        });
-
-        const unconfirmedUtxos = utxos.filter((utxo) => {
-          if (!utxo.status.confirmed) {
-            return true; // Unconfirmed transaction
-          }
-          if (currentBlockHeight === undefined || utxo.status.block_height === undefined) {
-            return false;
-          }
-          const confirmations = currentBlockHeight - utxo.status.block_height + 1;
-          return confirmations < 6;
-        });
-
-        const addressValue = confirmedUtxos.reduce((sum, utxo) => sum + utxo.value, 0);
-        const unconfirmedValue = unconfirmedUtxos.reduce((sum, utxo) => sum + utxo.value, 0);
-
-        totalUTXOs += confirmedUtxos.length;
-        totalBTC += addressValue;
-        totalUnconfirmedUTXOs += unconfirmedUtxos.length;
-        totalUnconfirmedBTC += unconfirmedValue;
-
-        // Only print addresses that have UTXOs (to reduce noise)
-        if (confirmedUtxos.length > 0 || unconfirmedUtxos.length > 0) {
-          const parts = [];
-          if (confirmedUtxos.length > 0) {
-            parts.push(`${confirmedUtxos.length} UTXOs (6+ conf), ${addressValue / 1e8} BTC`);
-          }
-          if (unconfirmedUtxos.length > 0) {
-            parts.push(`${unconfirmedUtxos.length} UTXOs (<6 conf), ${unconfirmedValue / 1e8} BTC`);
-          }
-          console.log(`✅ ${calculatedAddress}: ${parts.join(' | ')}`);
-        }
+        calculatedAddress = calculateTaprootAddress(addressInfo.id, xOnlyPubkey, network);
       } catch (error) {
-        console.error(`❌ Error processing ${addressInfo.id.substring(0, 16)}...:`, error);
+        console.error(`❌ Error calculating address for ${addressInfo.id.substring(0, 16)}...:`, error);
         failedCount++;
         failedAddresses.push(addressInfo.id);
+        continue;
+      }
+
+      // Verify our calculated address matches the reported one.
+      // If it doesn't match, the data source is either broken or malicious.
+      if (calculatedAddress !== addressInfo.address_for_verification) {
+        console.error(`❌ Address mismatch for ID ${addressInfo.id.substring(0, 16)}...`);
+        console.error(`   Reported:   ${addressInfo.address_for_verification}`);
+        console.error(`   Calculated: ${calculatedAddress}`);
+        failedCount++;
+        failedAddresses.push(addressInfo.id);
+        continue;
+      }
+
+      verifiedCount++;
+
+      // Step 4: Fetch UTXOs from the Bitcoin blockchain.
+      // This is the actual proof of reserve - checking what BTC exists on-chain.
+      // fetchUTXOs already retries transient failures with backoff. If it still
+      // fails, we cannot read this address's balance — so we abort the entire run
+      // rather than skip it or count it as zero. A proof-of-reserve total is only
+      // meaningful if it covers every address; a partial total would be misleading.
+      // We throw (rather than process.exit) so this function is safe to use as a
+      // library; the throw propagates past the per-address loop to the caller.
+      let utxos: UTXO[];
+      try {
+        utxos = await fetchUTXOs(calculatedAddress, network);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new ReserveVerificationError(
+          `Could not read on-chain UTXOs for ${calculatedAddress} after retries (${reason}). ` +
+            `Aborting without a reserve total — a complete on-chain read is required for a trustworthy ` +
+            `result. Check your Esplora endpoint (ESPLORA_API) and re-run.`
+        );
+      }
+
+      // Filter UTXOs to only count those with 6+ confirmations
+      const confirmedUtxos = utxos.filter((utxo) => {
+        if (!utxo.status.confirmed) {
+          return false; // Unconfirmed transaction
+        }
+        if (currentBlockHeight === undefined || utxo.status.block_height === undefined) {
+          // If we can't determine confirmations, count all confirmed UTXOs
+          return true;
+        }
+        const confirmations = currentBlockHeight - utxo.status.block_height + 1;
+        return confirmations >= 6;
+      });
+
+      const unconfirmedUtxos = utxos.filter((utxo) => {
+        if (!utxo.status.confirmed) {
+          return true; // Unconfirmed transaction
+        }
+        if (currentBlockHeight === undefined || utxo.status.block_height === undefined) {
+          return false;
+        }
+        const confirmations = currentBlockHeight - utxo.status.block_height + 1;
+        return confirmations < 6;
+      });
+
+      const addressValue = confirmedUtxos.reduce((sum, utxo) => sum + utxo.value, 0);
+      const unconfirmedValue = unconfirmedUtxos.reduce((sum, utxo) => sum + utxo.value, 0);
+
+      totalUTXOs += confirmedUtxos.length;
+      totalBTC += addressValue;
+      totalUnconfirmedUTXOs += unconfirmedUtxos.length;
+      totalUnconfirmedBTC += unconfirmedValue;
+
+      // Only print addresses that have UTXOs (to reduce noise)
+      if (confirmedUtxos.length > 0 || unconfirmedUtxos.length > 0) {
+        const parts = [];
+        if (confirmedUtxos.length > 0) {
+          parts.push(`${confirmedUtxos.length} UTXOs (6+ conf), ${addressValue / 1e8} BTC`);
+        }
+        if (unconfirmedUtxos.length > 0) {
+          parts.push(`${unconfirmedUtxos.length} UTXOs (<6 conf), ${unconfirmedValue / 1e8} BTC`);
+        }
+        console.log(`✅ ${calculatedAddress}: ${parts.join(' | ')}`);
       }
     }
 
@@ -514,10 +621,21 @@ async function verifyAndCalculateReserve(dataUrl: string = DEFAULT_DATA_URL): Pr
   console.log('Summary');
   console.log('='.repeat(80));
   console.log(`✅ Verified addresses: ${verifiedCount}/${verifiedCount + failedCount}`);
+
+  // If any address failed verification, report which ones and fail WITHOUT
+  // printing a reserve total — a run with failures must not emit a partial
+  // figure. We throw (not process.exit) so the function stays library-safe; the
+  // CLI entrypoint maps it to a non-zero exit. (An unreadable UTXO lookup throws
+  // even earlier, mid-loop, so it never reaches this summary either.)
   if (failedCount > 0) {
     console.log(`❌ Failed addresses: ${failedCount}`);
     console.log(`   Failed IDs: ${failedAddresses.map((id) => id.substring(0, 16)).join(', ')}...`);
+    console.log('='.repeat(80));
+    throw new ReserveVerificationError(
+      `${failedCount} of ${verifiedCount + failedCount} address(es) failed independent verification (see details above).`
+    );
   }
+
   console.log();
   console.log(`Confirmed UTXOs (6+ confirmations): ${totalUTXOs}`);
   console.log(`Total BTC in Reserve (6+ conf): ${(totalBTC / 1e8).toFixed(8)} BTC`);
@@ -527,11 +645,6 @@ async function verifyAndCalculateReserve(dataUrl: string = DEFAULT_DATA_URL): Pr
     console.log(`Total BTC pending (<6 conf): ${(totalUnconfirmedBTC / 1e8).toFixed(8)} BTC`);
   }
   console.log('='.repeat(80));
-
-  // Exit with error code if any verification failed
-  if (failedCount > 0) {
-    process.exit(1);
-  }
 }
 
 // Main execution
@@ -545,11 +658,19 @@ if (require.main === module) {
       process.exit(0);
     })
     .catch((error) => {
-      const message = error instanceof Error ? error.message : String(error);
-      console.error(`❌ Verification failed: ${message}`);
+      // The CLI is the only place that turns a failure into a process exit.
+      // ReserveVerificationError and the actionable fetch errors are expected,
+      // user-facing failures — a concise message is enough. Anything else is
+      // unexpected (a bug or an unhandled error), so log the full object with its
+      // stack to aid diagnosis.
+      if (error instanceof ReserveVerificationError) {
+        console.error(`❌ Verification failed: ${error.message}`);
+      } else {
+        console.error('❌ Verification failed:', error);
+      }
       process.exit(1);
     });
 }
 
-// Export functions for use as a library
-export { calculateTaprootAddress, verifyAndCalculateReserve };
+// Export functions and error type for use as a library
+export { calculateTaprootAddress, verifyAndCalculateReserve, ReserveVerificationError };
