@@ -328,15 +328,25 @@ async function fetchJsonWithRetry(url: string, attempts = 4): Promise<unknown> {
       return await response.json();
     }
 
-    // Non-2xx response. Retry only transient statuses (429 or 5xx); other 4xx
-    // are client errors that will not succeed on retry, so fail immediately.
+    // Non-2xx response. Release the unread body first: in Node's fetch (undici)
+    // an undrained body can block connection reuse and leak sockets across the
+    // many requests/retries a full run makes.
+    await response.body?.cancel();
+
+    // Retry only transient statuses (429 or 5xx); other 4xx are client errors
+    // that will not succeed on retry, so fail immediately.
     lastError = new Error(`HTTP ${response.status} ${response.statusText} for ${url}`);
     const transient = response.status === 429 || response.status >= 500;
     if (!transient) {
       throw lastError;
     }
     if (attempt < attempts) {
-      await sleep(500 * 2 ** (attempt - 1)); // Exponential backoff: 500ms, 1s, 2s, ...
+      // Honor a numeric Retry-After (seconds) when the server sends one, capped
+      // at 30s; otherwise fall back to exponential backoff (500ms, 1s, 2s, ...).
+      const retryAfter = Number(response.headers.get('retry-after'));
+      const delayMs =
+        Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter * 1000, 30_000) : 500 * 2 ** (attempt - 1);
+      await sleep(delayMs);
     }
   }
   const reason = lastError instanceof Error ? lastError.message : String(lastError);
