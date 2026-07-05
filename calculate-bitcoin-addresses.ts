@@ -582,10 +582,21 @@ async function verifyAndCalculateReserve(dataUrl: string = DEFAULT_DATA_URL): Pr
   console.log('Summary');
   console.log('='.repeat(80));
   console.log(`✅ Verified addresses: ${verifiedCount}/${verifiedCount + failedCount}`);
+
+  // If any address failed verification, report which ones and fail WITHOUT
+  // printing a reserve total — a run with failures must not emit a partial
+  // figure. We throw (not process.exit) so the function stays library-safe; the
+  // CLI entrypoint maps it to a non-zero exit. (An unreadable UTXO lookup throws
+  // even earlier, mid-loop, so it never reaches this summary either.)
   if (failedCount > 0) {
     console.log(`❌ Failed addresses: ${failedCount}`);
     console.log(`   Failed IDs: ${failedAddresses.map((id) => id.substring(0, 16)).join(', ')}...`);
+    console.log('='.repeat(80));
+    throw new ReserveVerificationError(
+      `${failedCount} of ${verifiedCount + failedCount} address(es) failed independent verification (see details above).`
+    );
   }
+
   console.log();
   console.log(`Confirmed UTXOs (6+ confirmations): ${totalUTXOs}`);
   console.log(`Total BTC in Reserve (6+ conf): ${(totalBTC / 1e8).toFixed(8)} BTC`);
@@ -595,16 +606,6 @@ async function verifyAndCalculateReserve(dataUrl: string = DEFAULT_DATA_URL): Pr
     console.log(`Total BTC pending (<6 conf): ${(totalUnconfirmedBTC / 1e8).toFixed(8)} BTC`);
   }
   console.log('='.repeat(80));
-
-  // Fail if any address failed verification. We throw (not process.exit) so this
-  // function stays library-safe; the CLI entrypoint maps it to a non-zero exit.
-  // (A UTXO lookup that fails after retries throws earlier, before this summary,
-  // so an incomplete reserve total is never printed.)
-  if (failedCount > 0) {
-    throw new ReserveVerificationError(
-      `${failedCount} of ${verifiedCount + failedCount} address(es) failed independent verification (see details above).`
-    );
-  }
 }
 
 // Main execution
@@ -619,8 +620,15 @@ if (require.main === module) {
     })
     .catch((error) => {
       // The CLI is the only place that turns a failure into a process exit.
-      const message = error instanceof Error ? error.message : String(error);
-      console.error(`❌ Verification failed: ${message}`);
+      // ReserveVerificationError is an expected, user-facing failure — a concise
+      // message is enough. Anything else is unexpected (a bug, or an unhandled
+      // network/library error), so log the full object with its stack to aid
+      // diagnosis.
+      if (error instanceof ReserveVerificationError) {
+        console.error(`❌ Verification failed: ${error.message}`);
+      } else {
+        console.error('❌ Verification failed:', error);
+      }
       process.exit(1);
     });
 }
