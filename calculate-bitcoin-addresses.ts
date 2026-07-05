@@ -84,6 +84,22 @@ interface UTXO {
 }
 
 /**
+ * Thrown when a complete, trustworthy reserve total cannot be produced — either
+ * an address's on-chain UTXOs could not be read, or one or more addresses failed
+ * independent verification.
+ *
+ * verifyAndCalculateReserve throws this instead of calling process.exit, so it is
+ * safe to use as a library: consumers can catch it. Only the CLI entrypoint turns
+ * it into a non-zero exit code.
+ */
+class ReserveVerificationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ReserveVerificationError';
+  }
+}
+
+/**
  * Hash a string using SHA-256
  *
  * This is used to derive the chain code for the unspendable key from the deposit ID.
@@ -467,93 +483,94 @@ async function verifyAndCalculateReserve(dataUrl: string = DEFAULT_DATA_URL): Pr
 
     // Step 3: Process each deposit account on this chain
     for (const addressInfo of chainGroup.addresses) {
+      // **CRITICAL STEP**: Calculate the address independently (we NEVER trust
+      // the reported address). A calculation error is specific to this account —
+      // record it and keep going; it does not invalidate the rest of the run.
+      let calculatedAddress: string;
       try {
-        // **CRITICAL STEP**: Calculate the address independently
-        // We NEVER trust the reported address
-        const calculatedAddress = calculateTaprootAddress(addressInfo.id, xOnlyPubkey, network);
-
-        // Verify our calculated address matches the reported one
-        // If it doesn't match, the data source is either broken or malicious
-        if (calculatedAddress !== addressInfo.address_for_verification) {
-          console.error(`❌ Address mismatch for ID ${addressInfo.id.substring(0, 16)}...`);
-          console.error(`   Reported:   ${addressInfo.address_for_verification}`);
-          console.error(`   Calculated: ${calculatedAddress}`);
-          failedCount++;
-          failedAddresses.push(addressInfo.id);
-          continue;
-        }
-
-        verifiedCount++;
-
-        // Step 4: Fetch UTXOs from the Bitcoin blockchain
-        // This is the actual proof of reserve - checking what BTC exists on-chain.
-        // fetchUTXOs already retries transient failures with backoff. If it still
-        // fails, we cannot read this address's balance — so we abort the entire
-        // run rather than skip it or count it as zero. A proof-of-reserve total is
-        // only meaningful if it covers every address; a partial total would be
-        // misleading, so we report none.
-        let utxos: UTXO[];
-        try {
-          utxos = await fetchUTXOs(calculatedAddress, network);
-        } catch (error) {
-          const reason = error instanceof Error ? error.message : String(error);
-          console.error();
-          console.error(`❌ Could not read on-chain UTXOs for ${calculatedAddress} after retries (${reason}).`);
-          console.error(`   Aborting without a reserve total — a complete on-chain read is required for a`);
-          console.error(`   trustworthy result. Check your Esplora endpoint (ESPLORA_API) and re-run.`);
-          process.exit(1);
-          // Unreachable: process.exit does not return. Kept explicit so control-flow
-          // analysis knows `utxos` is assigned below regardless of TS/type config.
-          throw error;
-        }
-
-        // Filter UTXOs to only count those with 6+ confirmations
-        const confirmedUtxos = utxos.filter((utxo) => {
-          if (!utxo.status.confirmed) {
-            return false; // Unconfirmed transaction
-          }
-          if (currentBlockHeight === undefined || utxo.status.block_height === undefined) {
-            // If we can't determine confirmations, count all confirmed UTXOs
-            return true;
-          }
-          const confirmations = currentBlockHeight - utxo.status.block_height + 1;
-          return confirmations >= 6;
-        });
-
-        const unconfirmedUtxos = utxos.filter((utxo) => {
-          if (!utxo.status.confirmed) {
-            return true; // Unconfirmed transaction
-          }
-          if (currentBlockHeight === undefined || utxo.status.block_height === undefined) {
-            return false;
-          }
-          const confirmations = currentBlockHeight - utxo.status.block_height + 1;
-          return confirmations < 6;
-        });
-
-        const addressValue = confirmedUtxos.reduce((sum, utxo) => sum + utxo.value, 0);
-        const unconfirmedValue = unconfirmedUtxos.reduce((sum, utxo) => sum + utxo.value, 0);
-
-        totalUTXOs += confirmedUtxos.length;
-        totalBTC += addressValue;
-        totalUnconfirmedUTXOs += unconfirmedUtxos.length;
-        totalUnconfirmedBTC += unconfirmedValue;
-
-        // Only print addresses that have UTXOs (to reduce noise)
-        if (confirmedUtxos.length > 0 || unconfirmedUtxos.length > 0) {
-          const parts = [];
-          if (confirmedUtxos.length > 0) {
-            parts.push(`${confirmedUtxos.length} UTXOs (6+ conf), ${addressValue / 1e8} BTC`);
-          }
-          if (unconfirmedUtxos.length > 0) {
-            parts.push(`${unconfirmedUtxos.length} UTXOs (<6 conf), ${unconfirmedValue / 1e8} BTC`);
-          }
-          console.log(`✅ ${calculatedAddress}: ${parts.join(' | ')}`);
-        }
+        calculatedAddress = calculateTaprootAddress(addressInfo.id, xOnlyPubkey, network);
       } catch (error) {
-        console.error(`❌ Error processing ${addressInfo.id.substring(0, 16)}...:`, error);
+        console.error(`❌ Error calculating address for ${addressInfo.id.substring(0, 16)}...:`, error);
         failedCount++;
         failedAddresses.push(addressInfo.id);
+        continue;
+      }
+
+      // Verify our calculated address matches the reported one.
+      // If it doesn't match, the data source is either broken or malicious.
+      if (calculatedAddress !== addressInfo.address_for_verification) {
+        console.error(`❌ Address mismatch for ID ${addressInfo.id.substring(0, 16)}...`);
+        console.error(`   Reported:   ${addressInfo.address_for_verification}`);
+        console.error(`   Calculated: ${calculatedAddress}`);
+        failedCount++;
+        failedAddresses.push(addressInfo.id);
+        continue;
+      }
+
+      verifiedCount++;
+
+      // Step 4: Fetch UTXOs from the Bitcoin blockchain.
+      // This is the actual proof of reserve - checking what BTC exists on-chain.
+      // fetchUTXOs already retries transient failures with backoff. If it still
+      // fails, we cannot read this address's balance — so we abort the entire run
+      // rather than skip it or count it as zero. A proof-of-reserve total is only
+      // meaningful if it covers every address; a partial total would be misleading.
+      // We throw (rather than process.exit) so this function is safe to use as a
+      // library; the throw propagates past the per-address loop to the caller.
+      let utxos: UTXO[];
+      try {
+        utxos = await fetchUTXOs(calculatedAddress, network);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new ReserveVerificationError(
+          `Could not read on-chain UTXOs for ${calculatedAddress} after retries (${reason}). ` +
+            `Aborting without a reserve total — a complete on-chain read is required for a trustworthy ` +
+            `result. Check your Esplora endpoint (ESPLORA_API) and re-run.`
+        );
+      }
+
+      // Filter UTXOs to only count those with 6+ confirmations
+      const confirmedUtxos = utxos.filter((utxo) => {
+        if (!utxo.status.confirmed) {
+          return false; // Unconfirmed transaction
+        }
+        if (currentBlockHeight === undefined || utxo.status.block_height === undefined) {
+          // If we can't determine confirmations, count all confirmed UTXOs
+          return true;
+        }
+        const confirmations = currentBlockHeight - utxo.status.block_height + 1;
+        return confirmations >= 6;
+      });
+
+      const unconfirmedUtxos = utxos.filter((utxo) => {
+        if (!utxo.status.confirmed) {
+          return true; // Unconfirmed transaction
+        }
+        if (currentBlockHeight === undefined || utxo.status.block_height === undefined) {
+          return false;
+        }
+        const confirmations = currentBlockHeight - utxo.status.block_height + 1;
+        return confirmations < 6;
+      });
+
+      const addressValue = confirmedUtxos.reduce((sum, utxo) => sum + utxo.value, 0);
+      const unconfirmedValue = unconfirmedUtxos.reduce((sum, utxo) => sum + utxo.value, 0);
+
+      totalUTXOs += confirmedUtxos.length;
+      totalBTC += addressValue;
+      totalUnconfirmedUTXOs += unconfirmedUtxos.length;
+      totalUnconfirmedBTC += unconfirmedValue;
+
+      // Only print addresses that have UTXOs (to reduce noise)
+      if (confirmedUtxos.length > 0 || unconfirmedUtxos.length > 0) {
+        const parts = [];
+        if (confirmedUtxos.length > 0) {
+          parts.push(`${confirmedUtxos.length} UTXOs (6+ conf), ${addressValue / 1e8} BTC`);
+        }
+        if (unconfirmedUtxos.length > 0) {
+          parts.push(`${unconfirmedUtxos.length} UTXOs (<6 conf), ${unconfirmedValue / 1e8} BTC`);
+        }
+        console.log(`✅ ${calculatedAddress}: ${parts.join(' | ')}`);
       }
     }
 
@@ -579,11 +596,14 @@ async function verifyAndCalculateReserve(dataUrl: string = DEFAULT_DATA_URL): Pr
   }
   console.log('='.repeat(80));
 
-  // Exit with an error code if any address failed verification. (A UTXO lookup
-  // that fails after retries aborts the run earlier, before this summary, so an
-  // incomplete reserve total is never printed.)
+  // Fail if any address failed verification. We throw (not process.exit) so this
+  // function stays library-safe; the CLI entrypoint maps it to a non-zero exit.
+  // (A UTXO lookup that fails after retries throws earlier, before this summary,
+  // so an incomplete reserve total is never printed.)
   if (failedCount > 0) {
-    process.exit(1);
+    throw new ReserveVerificationError(
+      `${failedCount} of ${verifiedCount + failedCount} address(es) failed independent verification (see details above).`
+    );
   }
 }
 
@@ -598,10 +618,12 @@ if (require.main === module) {
       process.exit(0);
     })
     .catch((error) => {
-      console.error('❌ Verification failed:', error);
+      // The CLI is the only place that turns a failure into a process exit.
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`❌ Verification failed: ${message}`);
       process.exit(1);
     });
 }
 
-// Export functions for use as a library
-export { calculateTaprootAddress, verifyAndCalculateReserve };
+// Export functions and error type for use as a library
+export { calculateTaprootAddress, verifyAndCalculateReserve, ReserveVerificationError };
