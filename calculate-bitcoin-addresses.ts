@@ -391,9 +391,9 @@ async function fetchBlockHeight(network: bitcoin.Network): Promise<number | unde
 
   try {
     return (await fetchJsonWithRetry(url)) as number;
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    console.warn(`Warning: could not fetch block height (${reason}).`);
+  } catch {
+    // Non-fatal, and intentionally silent: the caller owns the single
+    // user-facing warning and falls back to counting all confirmed UTXOs.
     return undefined;
   }
 }
