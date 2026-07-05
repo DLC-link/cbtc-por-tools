@@ -70,11 +70,43 @@ The tool talks to **two** external services. Both have working defaults, so `npm
 | **Address-calculation data** | Deposit account IDs + threshold xpubs used to derive the addresses | `https://api.mainnet.bitsafe.finance/cbtc/v1/address-calculation-data` | CLI argument, or `ADDRESS_CALCULATION_DATA_URL` |
 | **Esplora Bitcoin API** | On-chain UTXO lookups — the actual reserve check | `https://blockstream.info/api` (mainnet), `https://blockstream.info/testnet/api` (testnet), `http://localhost:3004` (regtest) | `ESPLORA_API` |
 
-> **Note:** the public Blockstream Esplora endpoints are rate limited. For a full mainnet run (hundreds of addresses) or any production use, point `ESPLORA_API` at your own Esplora / electrs instance:
->
-> ```bash
-> ESPLORA_API=https://your-esplora.example.com/api npm run calculate
-> ```
+#### A note on rate limits
+
+The public Blockstream endpoint is rate limited. Blockstream does not publish an
+exact limit for free/public use, but in practice:
+
+- Exceeding the limit returns HTTP `429 (Too Many Requests)`.
+- Repeated overage can get your IP **temporarily blocked**, sometimes even at a
+  fairly low request rate.
+
+A full mainnet run makes **one lookup per deposit account** (hundreds of requests),
+so it can hit these limits. The script issues these lookups **sequentially** (one
+at a time), which is the gentlest access pattern, but for large or repeated runs
+you have a few options:
+
+- **Handle the limit in the client.** On a `429`, retry with **exponential
+  backoff** (and honor a `Retry-After` header if present), and/or add a short
+  delay between requests. This is the simplest fix if you want to stay on the
+  public endpoint. See `fetchUTXOs` in
+  [`calculate-bitcoin-addresses.ts`](./calculate-bitcoin-addresses.ts) for where
+  to add throttling/backoff.
+- **Use another Esplora-compatible endpoint.** [mempool.space](https://mempool.space)
+  exposes the same API and is a drop-in via `ESPLORA_API` (it is also rate
+  limited, but gives you a second source):
+
+  ```bash
+  ESPLORA_API=https://mempool.space/api npm run calculate
+  ```
+
+- **Run your own Esplora / electrs instance** — no shared limits, best for
+  production or frequent runs:
+
+  ```bash
+  ESPLORA_API=https://your-esplora.example.com/api npm run calculate
+  ```
+
+- **Use a paid tier.** Blockstream's Explorer API offers paid tiers with
+  production-grade limits if you need higher throughput on their infrastructure.
 
 ### What It Does
 
