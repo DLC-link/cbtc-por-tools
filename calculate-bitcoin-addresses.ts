@@ -297,30 +297,50 @@ function sleep(ms: number): Promise<void> {
  * exponential backoff and, if every attempt fails, throw so the caller can
  * record the failure explicitly instead of counting the address as empty.
  *
+ * Only transient failures are retried: network-level errors and the HTTP
+ * statuses worth retrying (`429 Too Many Requests` and `5xx`). Other 4xx
+ * responses (e.g. 400/404) are client errors that will not succeed on retry, so
+ * they fail immediately rather than waiting through the backoff (which would
+ * also worsen rate limiting).
+ *
  * @param url - URL to fetch
  * @param attempts - Maximum number of attempts (default 4)
  * @returns Parsed JSON body
- * @throws If all attempts fail (non-2xx status or network error)
+ * @throws Immediately on a non-transient (non-429 4xx) response, or after all
+ *   attempts are exhausted on transient failures.
  */
 async function fetchJsonWithRetry(url: string, attempts = 4): Promise<unknown> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt++) {
+    let response: Response;
     try {
-      const response = await fetch(url);
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-      return await response.json();
+      response = await fetch(url);
     } catch (error) {
+      // Network-level failure (DNS, connection reset, TLS) — transient, retry.
       lastError = error;
       if (attempt < attempts) {
-        // Exponential backoff: 500ms, 1s, 2s, ...
-        await sleep(500 * 2 ** (attempt - 1));
+        await sleep(500 * 2 ** (attempt - 1)); // Exponential backoff: 500ms, 1s, 2s, ...
       }
+      continue;
+    }
+
+    if (response.ok) {
+      return await response.json();
+    }
+
+    // Non-2xx response. Retry only transient statuses (429 or 5xx); other 4xx
+    // are client errors that will not succeed on retry, so fail immediately.
+    lastError = new Error(`HTTP ${response.status} ${response.statusText} for ${url}`);
+    const transient = response.status === 429 || response.status >= 500;
+    if (!transient) {
+      throw lastError;
+    }
+    if (attempt < attempts) {
+      await sleep(500 * 2 ** (attempt - 1)); // Exponential backoff: 500ms, 1s, 2s, ...
     }
   }
   const reason = lastError instanceof Error ? lastError.message : String(lastError);
-  throw new Error(`failed after ${attempts} attempts (${reason})`);
+  throw new Error(`failed to fetch ${url} after ${attempts} attempts (${reason})`);
 }
 
 /**
