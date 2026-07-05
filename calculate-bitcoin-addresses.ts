@@ -486,6 +486,9 @@ async function verifyAndCalculateReserve(dataUrl: string = DEFAULT_DATA_URL): Pr
           console.error(`   Aborting without a reserve total — a complete on-chain read is required for a`);
           console.error(`   trustworthy result. Check your Esplora endpoint (ESPLORA_API) and re-run.`);
           process.exit(1);
+          // Unreachable: process.exit does not return. Kept explicit so control-flow
+          // analysis knows `utxos` is assigned below regardless of TS/type config.
+          throw error;
         }
 
         // Filter UTXOs to only count those with 6+ confirmations
