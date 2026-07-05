@@ -318,7 +318,9 @@ GET https://api.mainnet.bitsafe.finance/cbtc/v1/address-calculation-data
   - `addresses`: Array of deposit accounts on this chain
     - `id`: Deposit account ID (hex string)
     - `address_for_verification`: Reported Bitcoin address (DO NOT TRUST - must be independently calculated and verified!)
-- `bitcoin_network`: Bitcoin network ("mainnet", "testnet", "regtest")
+- `bitcoin_network`: Bitcoin network. The mainnet API returns `bitcoin` (which is
+  why the example output shows `Network: bitcoin`); `testnet` and `regtest` are the
+  other values. The tool also accepts `mainnet` as an alias for `bitcoin`.
 
 **Important:** The script **does not trust** the `address_for_verification` field. It independently calculates each address and verifies it matches. This prevents the data source from providing incorrect addresses.
 
