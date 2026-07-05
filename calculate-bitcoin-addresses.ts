@@ -287,6 +287,12 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Per-attempt network timeout. Node's fetch has no default timeout, so a stalled
+// connection (e.g. a firewall silently dropping packets) could hang forever and
+// defeat the fail-fast intent. Each attempt is bounded; a timeout counts as a
+// transient failure and is retried.
+const FETCH_TIMEOUT_MS = 15_000;
+
 /**
  * Fetch a URL and parse the body as JSON, retrying on transient failures.
  *
@@ -314,9 +320,9 @@ async function fetchJsonWithRetry(url: string, attempts = 4): Promise<unknown> {
   for (let attempt = 1; attempt <= attempts; attempt++) {
     let response: Response;
     try {
-      response = await fetch(url);
+      response = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
     } catch (error) {
-      // Network-level failure (DNS, connection reset, TLS) — transient, retry.
+      // Network-level failure (DNS, connection reset, TLS, or timeout) — transient, retry.
       lastError = error;
       if (attempt < attempts) {
         await sleep(500 * 2 ** (attempt - 1)); // Exponential backoff: 500ms, 1s, 2s, ...
