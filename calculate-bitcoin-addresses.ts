@@ -267,9 +267,13 @@ async function fetchDepositAddresses(dataUrl: string): Promise<ApiResponse> {
   try {
     return JSON.parse(body) as ApiResponse;
   } catch {
-    const preview = body.slice(0, 80).replace(/\s+/g, ' ').trim();
+    const snippet = body.slice(0, 80).replace(/\s+/g, ' ').trim();
+    // Only append an ellipsis if the body was actually longer than the snippet,
+    // and JSON.stringify the preview so embedded quotes (common in HTML) are
+    // escaped rather than confusing the message.
+    const preview = body.length > 80 ? `${snippet}…` : snippet;
     throw new Error(
-      `The address-calculation endpoint at ${dataUrl} did not return valid JSON (got: "${preview}..."). ` +
+      `The address-calculation endpoint at ${dataUrl} did not return valid JSON (got: ${JSON.stringify(preview)}). ` +
         `Make sure the URL points at the address-calculation-data API, not a web page.`
     );
   }
