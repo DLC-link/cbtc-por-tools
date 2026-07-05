@@ -108,6 +108,12 @@ you have a few options:
 - **Use a paid tier.** Blockstream's Explorer API offers paid tiers with
   production-grade limits if you need higher throughput on their infrastructure.
 
+_Last verified: with the current implementation, a full mainnet run against the
+default Blockstream endpoint completed end-to-end and returned a complete, verified
+reserve total (every deposit account's independently calculated address matched the
+reported one) as of **July 5, 2026**, with no rate-limiting encountered. Public
+endpoints and their limits can change over time, so re-verify for your own use._
+
 ### What It Does
 
 The calculation script:
@@ -334,6 +340,16 @@ This ensures:
 - ✅ No addresses can be excluded or added
 - ✅ UTXO data comes from the Bitcoin blockchain, not the data source
 - ✅ Complete trustless verification of proof of reserves
+
+### Going Further: Cross-Check Two Independent Sources
+
+The steps above trust a single blockchain data provider for the on-chain UTXO
+lookups. For the strongest assurance, the **gold standard** is to query the UTXOs
+from **two independent Esplora sources** (for example Blockstream and
+mempool.space, or your own node) and flag any disagreement between them. Requiring
+two independent sources to agree removes trust in any single provider — a buggy or
+compromised source cannot silently distort the reserve total on its own. This is
+not implemented here, but is recommended for high-assurance deployments.
 
 ## Example Output
 
