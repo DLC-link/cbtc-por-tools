@@ -264,12 +264,35 @@ function calculateTaprootAddress(id: string, xOnlyPubkey: Buffer, network: bitco
 async function fetchDepositAddresses(dataUrl: string): Promise<ApiResponse> {
   console.log(`Fetching address calculation data from: ${dataUrl}`);
 
-  const response = await fetch(dataUrl);
-  if (!response.ok) {
-    throw new Error(`HTTP error! status: ${response.status}`);
+  // Network-level failure (bad host, no connectivity, TLS error, etc.)
+  let response: Response;
+  try {
+    response = await fetch(dataUrl);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new ReserveVerificationError(`Could not reach the address-calculation endpoint at ${dataUrl} (${reason}). Check the URL and your network connection.`);
   }
 
-  return (await response.json()) as ApiResponse;
+  if (!response.ok) {
+    throw new ReserveVerificationError(`The address-calculation endpoint at ${dataUrl} returned HTTP ${response.status}. Check that the URL is correct.`);
+  }
+
+  // Guard against a non-JSON body (e.g. a redirect to an HTML page): the raw
+  // JSON.parse error is cryptic, so surface a clear, actionable message instead.
+  const body = await response.text();
+  try {
+    return JSON.parse(body) as ApiResponse;
+  } catch {
+    const snippet = body.slice(0, 80).replace(/\s+/g, ' ').trim();
+    // Only append an ellipsis if the body was actually longer than the snippet,
+    // and JSON.stringify the preview so embedded quotes (common in HTML) are
+    // escaped rather than confusing the message.
+    const preview = body.length > 80 ? `${snippet}…` : snippet;
+    throw new ReserveVerificationError(
+      `The address-calculation endpoint at ${dataUrl} did not return valid JSON (got: ${JSON.stringify(preview)}). ` +
+        `Make sure the URL points at the address-calculation-data API, not a web page.`
+    );
+  }
 }
 
 /**
@@ -445,8 +468,13 @@ async function verifyAndCalculateReserve(dataUrl: string = DEFAULT_DATA_URL): Pr
   const data = await fetchDepositAddresses(dataUrl);
   const network = getBitcoinNetwork(data.bitcoin_network);
 
+  // Total deposit accounts across all chains — also used to report progress
+  // during the (potentially long) per-address on-chain lookups below.
+  const totalAddresses = data.chains.reduce((sum, chainGroup) => sum + chainGroup.addresses.length, 0);
+
   console.log(`Network: ${data.bitcoin_network}`);
   console.log(`Total chains: ${data.chains.length}`);
+  console.log(`Total deposit accounts: ${totalAddresses}`);
   console.log();
 
   // Fetch current block height to calculate confirmations
@@ -469,6 +497,12 @@ async function verifyAndCalculateReserve(dataUrl: string = DEFAULT_DATA_URL): Pr
   let totalUnconfirmedUTXOs = 0;
   let totalUnconfirmedBTC = 0;
 
+  // Progress tracking: the per-address on-chain lookups are sequential and can
+  // take minutes, and only funded addresses print a line — so emit a periodic
+  // heartbeat to make it obvious the run is still working, not hung.
+  let processed = 0;
+  const PROGRESS_INTERVAL = 50;
+
   // Step 2: Process each chain (different Canton networks with different signer groups)
   for (const chainGroup of data.chains) {
     console.log(`Chain: ${chainGroup.chain} (xpub: ${chainGroup.xpub.substring(0, 20)}...)`);
@@ -483,6 +517,11 @@ async function verifyAndCalculateReserve(dataUrl: string = DEFAULT_DATA_URL): Pr
 
     // Step 3: Process each deposit account on this chain
     for (const addressInfo of chainGroup.addresses) {
+      processed++;
+      if (processed % PROGRESS_INTERVAL === 0 || processed === totalAddresses) {
+        console.log(`  …progress: ${processed}/${totalAddresses} deposit accounts processed`);
+      }
+
       // **CRITICAL STEP**: Calculate the address independently (we NEVER trust
       // the reported address). A calculation error is specific to this account —
       // record it and keep going; it does not invalidate the rest of the run.
@@ -620,10 +659,10 @@ if (require.main === module) {
     })
     .catch((error) => {
       // The CLI is the only place that turns a failure into a process exit.
-      // ReserveVerificationError is an expected, user-facing failure — a concise
-      // message is enough. Anything else is unexpected (a bug, or an unhandled
-      // network/library error), so log the full object with its stack to aid
-      // diagnosis.
+      // ReserveVerificationError and the actionable fetch errors are expected,
+      // user-facing failures — a concise message is enough. Anything else is
+      // unexpected (a bug or an unhandled error), so log the full object with its
+      // stack to aid diagnosis.
       if (error instanceof ReserveVerificationError) {
         console.error(`❌ Verification failed: ${error.message}`);
       } else {
